@@ -9,19 +9,23 @@ from ibapi.common import *
 import pandas as pd
 import time
 from datetime import datetime, timedelta
+from threading import RLock
 
 class IBWrapper(EWrapper):
     def __init__(self, market_data_dict):
         EWrapper.__init__(self)
+        self.optionsDataLock = RLock()
+
         self.req_ids = market_data_dict
-        self.positions = pd.DataFrame(columns=["Account", "Symbol", "Quantity", "Avg Cost", "Id", "Underlying"])
+        self.positions = pd.DataFrame(columns=["Account", "Symbol", "Quantity", "Avg Cost", "Id", "Underlying", "OptionType"])
         self.market_data = pd.DataFrame(columns=["Symbol", "DateTime", "Price"])
-        self.options_data = pd.DataFrame(columns=[
-            "Id", "Symbol", "Strike", "undPrice", "Type", "delta", "bid", "ask", "Expiry",
-            "close", "last", "high", "low",
-            "ConId", "UnderConId", "impliedVol", "optPrice", "pvDividend", "gamma", "vega", "theta"
-        ])
-        self.options_data.set_index('Id', inplace=True)
+        with self.optionsDataLock:
+            self.options_data = pd.DataFrame(columns=[
+                "Id", "Symbol", "Strike", "undPrice", "Type", "delta", "bid", "ask", "Expiry",
+                "close", "last", "high", "low",
+                "ConId", "UnderConId", "impliedVol", "optPrice", "pvDividend", "gamma", "vega", "theta", "delta_diff"
+            ])
+            self.options_data.set_index('Id', inplace=True)
         self.market_data.set_index('Symbol', inplace=True)
 
 
@@ -31,7 +35,7 @@ class IBWrapper(EWrapper):
     def position(self, account: str, contract: Contract, position: float, avgCost: float):
         if (position!= 0):
             print("Position.", "Account:", account, "Symbol:", contract.symbol, "Quantity:", position, "Avg cost:", avgCost)
-            new_row = {"Account": account, "Symbol": contract.localSymbol, "Quantity": position, "Avg Cost": avgCost, "Id": contract.conId, "Underlying": contract.symbol}
+            new_row = {"Account": account, "Symbol": contract.localSymbol, "Quantity": position, "Avg Cost": avgCost, "Id": contract.conId, "Underlying": contract.symbol, "OptionType": contract.right}    
             self.positions = pd.concat([self.positions, pd.DataFrame([new_row])], ignore_index=True)
 
     @iswrapper
@@ -47,15 +51,16 @@ class IBWrapper(EWrapper):
         if ("id" in entry):
             id = entry["id"]
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
+            with self.optionsDataLock:
 
-            self.options_data.loc[id, "impliedVol"] = impliedVol
-            self.options_data.loc[id, "delta"] = delta
-            self.options_data.loc[id, "optPrice"] = optPrice
-            self.options_data.loc[id, "pvDividend"] = pvDividend
-            self.options_data.loc[id, "gamma"] = gamma
-            self.options_data.loc[id, "vega"] = vega
-            self.options_data.loc[id, "theta"] = theta
-            self.options_data.loc[id, "undPrice"] = undPrice
+                self.options_data.loc[id, "impliedVol"] = impliedVol
+                self.options_data.loc[id, "delta"] = delta
+                self.options_data.loc[id, "optPrice"] = optPrice
+                self.options_data.loc[id, "pvDividend"] = pvDividend
+                self.options_data.loc[id, "gamma"] = gamma
+                self.options_data.loc[id, "vega"] = vega
+                self.options_data.loc[id, "theta"] = theta
+                self.options_data.loc[id, "undPrice"] = undPrice
 
         return super().tickOptionComputation(reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice)
     
@@ -74,8 +79,8 @@ class IBWrapper(EWrapper):
         elif ("id" in entry):
             id = entry["id"]
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
-
-            self.options_data.loc[id, text] = price
+            with self.optionsDataLock:
+                self.options_data.loc[id, text] = price
 
 
     @iswrapper
@@ -92,7 +97,8 @@ class IBWrapper(EWrapper):
             "UnderConId": contractDetails.underConId,
             
         }
-        self.options_data.loc[contractDetails.contract.conId] = new_row
+        with self.optionsDataLock:
+            self.options_data.loc[contractDetails.contract.conId] = new_row
 
     def contractDetailsEnd(self, reqId):
         return super().contractDetailsEnd(reqId)

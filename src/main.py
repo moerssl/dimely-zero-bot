@@ -23,14 +23,22 @@ def main():
 
     print("Fetching positions...")
     app.fetch_positions()
+    app.reqAllOpenOrders()
 
-    symbols = [("SPX","IND","CBOE"), ("VIX","IND","CBOE"), ("QQQ","STK","SMART"), ("IWM","STK","SMART")]
+    symbols = [
+        ("VIX","IND","CBOE"), 
+        ("SPX","IND","CBOE"), 
+        ("SPY","STK","SMART"),
+        ("QQQ","STK","SMART"), 
+        ("IWM","STK","SMART")
+    ]
     app.request_market_data(symbols)
-
     app.fetch_options_data(symbols)
 
-    data = app.getTilesData()
-    print(data)
+    app.reqHistoricalDataFor("SPX","IND","CBOE")
+
+    #data = app.getTilesData()
+    #print(data)
 
 
     # Start the display thread
