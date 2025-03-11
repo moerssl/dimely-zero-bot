@@ -3,16 +3,31 @@ import curses
 
 import curses
 import datetime
+import time
+import numpy as np
 
 import pandas as pd
 import talib
 
 from ib.IBApp import IBApp
+from multiprocessing import Process
+import  matplotlib.pyplot  as plt
 
 def display_data_tiled(screen, app: IBApp):
     curses.curs_set(0)
     screen.nodelay(True)
     screen.timeout(500)
+    
+    """
+    def chart():
+        while True:
+            app.plot_candlestick("SPX")
+            plt.pause(0.01)
+    
+
+    chartThread = Process(target=chart)
+    chartThread.start()
+    """
 
     display_data = True
     while True:
@@ -111,14 +126,16 @@ def display_data_tiled(screen, app: IBApp):
                                 row_line = ""
                                 for col, width in selected_cols:
                                     idx = content.columns.get_loc(col)
-                                    cell_val = str(row_data[idx])
-                                    row_line += cell_val.ljust(width)
+                                    if (np.isscalar(idx)):
+                                        cell_val = str(row_data[idx])
+                                        row_line += cell_val.ljust(width)
                                 screen.addstr(current_y + i + 2, current_x, row_line[:tile_width-1])
                     
                         else:
                             for i, line in enumerate(str(content).split('\n')):
                                 if i < tile_height - 1:
-                                    screen.addstr(current_y + i + 1, current_x, line[:tile_width-1])
+                                    if (line is not None):
+                                        screen.addstr(current_y + i + 1, current_x, line[:tile_width-1])
                                 
                     # Move current_x by the tile's width.
                     current_x += tile_width
@@ -166,6 +183,9 @@ def display_data_tiled(screen, app: IBApp):
         if key == ord('c'):
             app.addToActionLog("C key pressed")
             app.send_credit_spread_order("SPX", 0.15, "C")
+
+        if key == ord('q'):
+            app.candlesAsCsv("SPX")
 
         """
         target_time = "21:55"
