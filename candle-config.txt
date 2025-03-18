@@ -1,0 +1,14 @@
+date
+open
+high
+low
+close
+doji
+hammer
+adx
+day_high_remaining
+day_low_remaining
+day_high_remaining_today
+day_low_remaining_today
+call_strike
+put_strike

@@ -30,13 +30,33 @@ class IBWrapper(EWrapper):
 
 
         self.contract_details = {}
-    
+
     @iswrapper
     def position(self, account: str, contract: Contract, position: float, avgCost: float):
-        if (position!= 0):
-            print("Position.", "Account:", account, "Symbol:", contract.symbol, "Quantity:", position, "Avg cost:", avgCost)
-            new_row = {"Account": account, "Symbol": contract.localSymbol, "Quantity": position, "Avg Cost": avgCost, "Id": contract.conId, "Underlying": contract.symbol, "OptionType": contract.right}    
-            self.positions = pd.concat([self.positions, pd.DataFrame([new_row])], ignore_index=True)
+        if position != 0:
+            print("Position.", "Account:", account, "Symbol:", contract.symbol, 
+                "Quantity:", position, "Avg cost:", avgCost)
+            
+            # Create a new row as a dictionary with all DataFrame columns
+            new_row = {
+                "Account": account,
+                "Symbol": contract.localSymbol,
+                "Quantity": position,
+                "Avg Cost": avgCost,
+                "Id": contract.conId,
+                "Underlying": contract.symbol,
+                "OptionType": contract.right
+            }
+
+            # Check if the contract.conId already exists in the DataFrame
+            if contract.conId in self.positions["Id"].values:
+                # Update the existing row
+                self.positions.loc[self.positions["Id"] == contract.conId, new_row.keys()] = list(new_row.values())
+            else:
+                # Add the new row if it doesn't exist
+                self.positions = pd.concat([self.positions, pd.DataFrame([new_row])], ignore_index=True)
+
+
 
     @iswrapper
     def positionEnd(self):

@@ -22,10 +22,12 @@ import joblib
 import talib
 import scipy.stats as stats
 from scipy.stats import norm
+from util.Chart import Chart
 from util.StrategyEnum import StrategyEnum
+from util.AdaptiveDataframeProcessor import AdaptiveDataframeProcessor
 
 logger = getLogger(__name__)
-logger.setLevel("INFO")
+# logger.setLevel("INFO")
 
 
 class IBApp(IBWrapper, IBClient):
@@ -42,11 +44,21 @@ class IBApp(IBWrapper, IBClient):
         IBClient.__init__(self, self)
         self.reqId = 0
         self.cond = Condition()
+        
         self.apiOrderLock = RLock()
         self.candleLock = RLock()
+
+        self.predictLock = RLock()
+        self.predctThread = None
+
         self.candleData = {}
         self.daily_predictions = pd.DataFrame(columns=["date", "symbol", "predicted_close", "actual_close", "target_hit"])
         self.models = {}  # Store models for each symbol
+
+        self.chart_handler: Chart = None
+        self.lookBackTime = "14 D"
+        self.mergePredictThread = None
+        self.chartData = None
 
     def nextReqId(self):
         self.reqId += 1
@@ -247,12 +259,13 @@ class IBApp(IBWrapper, IBClient):
                 "content": self.positions
             },
             {
+                "title": "Free To Trade?",
+                "content": forDisplay(self.checkUnderlyingOptions()).reset_index()
+
+            },
+            {
                 "title": "SPX Trades",
                 "content": forDisplay(self.construct_from_underlying("SPX", 15, 5))
-            },
-                        {
-                "title": "QQQ Trades",
-                "content": forDisplay(self.construct_from_underlying("QQQ",2,2))
             },
             {
                 "title": "SPX 15 Delta Bear Call",
@@ -262,6 +275,7 @@ class IBApp(IBWrapper, IBClient):
                 "title": "SPX 15 Delta Bull Put",
                 "content": forDisplay(self.build_credit_spread("SPX", 0.15, "P"))
             },
+            
             {
                 "title": "Candle Data",
                 "content": self.candleData.get("SPX", pd.DataFrame()).iloc[::-1],
@@ -630,7 +644,8 @@ class IBApp(IBWrapper, IBClient):
 
         self.market_data_req_ids[reqId] = { "symbol": symbol }
         self.addToActionLog("Requesting historical data for " + symbol + " "+ str(reqId ))
-        self.reqHistoricalData(reqId, contract, "", "5 D", "5 mins", "TRADES", 1, 1, True, [])
+        
+        self.reqHistoricalData(reqId, contract, "", self.lookBackTime, "5 mins", "TRADES", 1, 1, True, [])
         time.sleep(0.1)  # To avoid pacing violations
 
 
@@ -638,6 +653,7 @@ class IBApp(IBWrapper, IBClient):
     @iswrapper
     def historicalData(self, reqId, bar: BarData):
         self.logger.debug(f"Received historicalData for reqId: {reqId}")
+        print(bar.date)
         
         if reqId not in self.market_data_req_ids:
             self.logger.error(f"reqId {reqId} not found in market_data_req_ids")
@@ -689,11 +705,27 @@ class IBApp(IBWrapper, IBClient):
             
             # --- 2. Technical Indicators Using TA-Lib ---
             # Convert the 'close' prices to a numpy array for TA-Lib
+            open = self.candleData[symbol]["open"].values.astype(float)
             close = self.candleData[symbol]["close"].values.astype(float)
+            high = self.candleData[symbol]["high"].values.astype(float)
+            low = self.candleData[symbol]["low"].values.astype(float)
             
             # Calculate SMA with period 5
             sma5 = talib.SMA(close, timeperiod=5)
             self.candleData[symbol]["SMA5"] = sma5
+
+            ema5 = talib.EMA(close, timeperiod=5)
+            self.candleData[symbol]["EMA5"] = ema5
+
+            doji = talib.CDLDOJI(open, high, low, close)
+            hammer = talib.CDLHAMMER(open, high, low, close)
+            adx = talib.ADX(high, low, close, 5)
+
+            self.candleData[symbol]["doji"] = doji
+            self.candleData[symbol]["hammer"] = hammer
+            self.candleData[symbol]["adx"] = adx
+
+
 
             rsi = talib.RSI(close, timeperiod=14)
             self.candleData[symbol]["RSI"] = rsi
@@ -703,7 +735,7 @@ class IBApp(IBWrapper, IBClient):
                 self.candleData[symbol]["high"].values.astype(float),
                 self.candleData[symbol]["low"].values.astype(float),
                 close,
-                timeperiod=14
+                timeperiod=78
             )
 
             # Convert ATR to percentage of closing price
@@ -730,10 +762,10 @@ class IBApp(IBWrapper, IBClient):
             # - If close < lower band: SELL CALL CREDIT SPREAD
             # Otherwise: HOLD
             tech_signal = np.where(
-                (close > upperband) & (atr_percent < 0.3) & (rsi > 70),
+                (high > upperband - atr * 0.25) & (rsi > 70),
                 StrategyEnum.SellCall,  # Signal for selling call credit spread
                 np.where(
-                    (close < lowerband) & (atr_percent < 0.3) & (rsi < 30),
+                    (low < lowerband + atr * 0.25) & (rsi < 30),
                     StrategyEnum.SellPut,  # Signal for selling put credit spread
                     np.where(
                         (atr_percent < 0.2) & (abs(close - middleband) < 0.25 * atr) & (rsi > 30) & (rsi < 70),
@@ -763,6 +795,53 @@ class IBApp(IBWrapper, IBClient):
             # Convert remaining minutes into number of 5-minute intervals (there are 78 intervals in 390 minutes)
             remaining_intervals = (remaining_minutes // 5)
             self.candleData[symbol]["remaining_intervals"] = remaining_intervals
+
+            def checkDayRange(df: pd.DataFrame):
+                # Identify new day start
+                df['new_day'] = df['remaining_intervals'] > df['remaining_intervals'].shift(1)
+
+                # Forward-fill the new day to create groups
+                df['day_group'] = df['new_day'].cumsum()
+
+                df['day_high'] = df.groupby("day_group")['high'].transform('max')
+                df['day_low'] = df.groupby("day_group")['low'].transform('min')
+                # Calculate high and low for the remaining part of the day
+                remaining_highs = []
+                remaining_lows = []
+
+                for i in range(len(df)):
+                    # Get the current day group
+                    day_group = df.loc[i, 'day_group']
+                    
+                    # Filter data for the current day group
+                    same_day_data = df[df['day_group'] == day_group]
+
+                    # Check if the current day group has complete data
+                    
+                    # Only use data from the current row to the end of the day
+                    remaining_data = same_day_data[same_day_data.index >= i]
+                    remaining_highs.append(remaining_data['high'].max())
+                    remaining_lows.append(remaining_data['low'].min())
+                    
+
+                df['day_high_remaining'] = remaining_highs
+                df['day_low_remaining'] = remaining_lows
+
+                # Find the maximum day_group
+                max_day_group = df['day_group'].max()
+
+                # Move values to day_high_remaining_today and set day_high_remaining to NaN for rows with the highest day_group
+                df.loc[df['day_group'] == max_day_group, 'day_high_remaining_today'] = df.loc[df['day_group'] == max_day_group, 'day_high_remaining']
+                df.loc[df['day_group'] == max_day_group, 'day_high_remaining'] = np.nan
+
+                # Move values to day_high_remaining_today and set day_high_remaining to NaN for rows with the highest day_group
+                df.loc[df['day_group'] == max_day_group, 'day_low_remaining_today'] = df.loc[df['day_group'] == max_day_group, 'day_low_remaining']
+                df.loc[df['day_group'] == max_day_group, 'day_low_remaining'] = np.nan
+
+                return df
+
+            
+            self.candleData[symbol] = checkDayRange(self.candleData[symbol])
             
             # Use available data (ideally today's candles) for volatility calculations.
             # Here we compute five-minute returns and their standard deviation in percentage terms.
@@ -835,29 +914,64 @@ class IBApp(IBWrapper, IBClient):
             # Here we combine the TA-Lib technical signal and the probability-based indicators.
             # For instance, if the technical indicator signals SELL PUT and the call probability > 0.8,
             # we issue a SELL PUT CREDIT SPREAD signal. Similarly for SELL CALL.
+            # Shift the tech_signal array manually
+            previous_tech_signal = np.roll(tech_signal, shift=1)
+            previous_tech_signal[0] = StrategyEnum.Hold  # Default value for the first row
+
+            # Updated final_signal logic
             final_signal = np.where(
-                (tech_signal == StrategyEnum.SellPut) & (call_probabilities > 0.8),
-                StrategyEnum.SellPut,  # Confirm SellPut signal based on call probabilities
+                (previous_tech_signal == StrategyEnum.SellPut) & 
+                (call_probabilities > 0.8) & 
+                (atr_percent < 0.3),
+                StrategyEnum.SellPut,  # Confirm SellPut signal
                 np.where(
-                    (tech_signal == StrategyEnum.SellCall) & (put_probabilities > 0.8),
-                    StrategyEnum.SellCall,  # Confirm SellCall signal based on put probabilities
+                    (previous_tech_signal == StrategyEnum.SellCall) & 
+                    (put_probabilities > 0.8) & 
+                    (atr_percent < 0.3),
+                    StrategyEnum.SellCall,  # Confirm SellCall signal
                     np.where(
-                        (tech_signal == StrategyEnum.SellIronCondor) & (call_probabilities > 0.8) & (put_probabilities > 0.8),
-                        StrategyEnum.SellIronCondor,  # Confirm Iron Condor if both probabilities are high
-                        StrategyEnum.Hold  # Default to holding if no conditions are met
+                        (previous_tech_signal == StrategyEnum.SellIronCondor) & 
+                        (call_probabilities > 0.8) & 
+                        (put_probabilities > 0.8),
+                        StrategyEnum.SellIronCondor,  # Confirm SellIronCondor
+                        StrategyEnum.Hold  # Default to holding
                     )
                 )
             )
 
+            def adjustStrikes(df):
+                # Adjust call_strike and put_strike when final_signal is not StrategyEnum.Hold
+                df['adjusted_call_strike'] = np.where(
+                    df['final_signal'] != StrategyEnum.Hold,
+                    np.maximum(df['call_strike'], df['call_strike'].shift(1, fill_value=df['call_strike'].iloc[0])),
+                    df['call_strike']
+                )
+
+                df['adjusted_put_strike'] = np.where(
+                    df['final_signal'] != StrategyEnum.Hold,
+                    np.minimum(df['put_strike'], df['put_strike'].shift(1, fill_value=df['put_strike'].iloc[0])),
+                    df['put_strike']
+                )
+
+                return df
+
+            self.candleData[symbol] = adjustStrikes(self.candleData[symbol])
+
             self.candleData[symbol]["final_signal"] = final_signal
+            
+    def get_chart_data(self, mergePredictions = False):
+        symbol = "SPX"
 
-
+        if (symbol not in self.candleData):
+            return pd.DataFrame()
+        self.addToActionLog("Plot chart with data")
+        return self.candleData[symbol]
         
     @iswrapper
     def historicalDataEnd(self, reqId, start: str, end: str):
         self.addToActionLog("Historical data request completed for reqId: " + str(reqId))
-        with self.candleLock:
-            self.addIndicators(reqId)
+        
+        self.addIndicators(reqId)
         return super().historicalDataEnd(reqId, start, end)
 
     @iswrapper
@@ -866,7 +980,7 @@ class IBApp(IBWrapper, IBClient):
         try:
             with self.candleLock:
                 self.historicalData(reqId, bar)
-                self.addIndicators(reqId)
+            self.addIndicators(reqId)
         except Exception as e:
             self.logger.error(f"Error in historicalDataUpdate: {e}")
             self.addToActionLog("Error in historicalDataUpdate: ")
@@ -874,5 +988,27 @@ class IBApp(IBWrapper, IBClient):
         return super().historicalDataUpdate(reqId, bar)
 
 
+    def checkUnderlyingOptions(self):
+        symbol = "SPX"
+        signal = None
+        date = None
+        put = None
+        call = None
+        if ("SPX" in self.candleData):
+            df: pd.DataFrame = self.candleData[symbol]
+            if (len(df) > 1 and "final_signal" in df.columns):
+                row = df.iloc[-1]
+                signal = row["final_signal"]
+                date = row["date"]
+                put = row["put_strike"]
+                call = row["call_strike"]
+        return {
+            "hasSpxCall": self.hasOrdersOrPositions(symbol, "C"),
+            "hasSpxPut": self.hasOrdersOrPositions(symbol, "P"),
+            "signal": signal,
+            "date": date,
+            "call": call,
+            "put": put
 
+        }
 
