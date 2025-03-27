@@ -1,12 +1,19 @@
 from flask import Flask, jsonify
-from ib.IBApp import IBApp
 import pandas as pd
 
 class Api:
-    def __init__(self, server: Flask, app: IBApp, config_file: str):
+    def __init__(self, server: Flask, app, config_file: str):
         self.server = server
         self.app = app
         self.config_file = config_file
+
+        @self.server.route("/api/all", methods=["GET"])
+        def getAll():
+            """Endpoint to fetch all data."""
+            chart_data: pd.DataFrame = self.app.get_chart_data(mergePredictions=True)
+            if isinstance(chart_data, pd.DataFrame):
+                chart_data = chart_data.iloc[::-1]
+                return chart_data.to_html(index=False)
 
         @self.server.route("/api/candle", methods=["GET"])
         def getCandle():

@@ -3,6 +3,7 @@ import multiprocessing
 from time import sleep
 from ib.IBApp import IBApp
 import curses
+
 from display.tiled import display_data, display_data_old, display_data_tiled
 from display.dash_app import start_dash_app
 from util.Chart import Chart
@@ -39,13 +40,6 @@ def main():
     app.fetch_options_data(symbols)
 
     app.reqHistoricalDataFor("SPX","IND","CBOE")
-
-    #data = app.getTilesData()
-    #print(data)
-    chart = Chart()
-    chart.initialize()
-   
-
 
     # Start the Dash charting app in a separate thread
     dash_thread = threading.Thread(target=start_dash_app, args=(app,), daemon=True)

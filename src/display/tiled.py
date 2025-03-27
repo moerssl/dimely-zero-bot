@@ -7,6 +7,8 @@ import datetime
 import pandas as pd
 import talib
 
+import schedule
+
 from ib.IBApp import IBApp
 
 def display_data_tiled(screen, app: IBApp):
@@ -14,8 +16,19 @@ def display_data_tiled(screen, app: IBApp):
     screen.nodelay(True)
     screen.timeout(500)
 
+    def catch_up():
+        app.addToActionLog("Catching up...")
+        app.reqHistoricalDataFor("SPX","IND","CBOE", True)
+
+    def saveCandles():
+        app.saveCandle()
+
+    schedule.every(30).seconds.do(catch_up)    
+    schedule.every(1).minutes.do(saveCandles)
+
     display_data = True
     while True:
+        schedule.run_pending()
         # Clear the screen
         screen.clear()
         # Get screen dimensions
@@ -166,10 +179,13 @@ def display_data_tiled(screen, app: IBApp):
         if key == ord('c'):
             app.addToActionLog("C key pressed")
             app.send_credit_spread_order("SPX", 0.15, "C")
+        if key == ord('i'):
+            app.addToActionLog("C key pressed")
+            app.send_iron_condor_order("SPX", 5, 5)
 
-        """
-        target_time = "21:55"
-        target_close_time = "22:00"
+        
+        target_time = "20:55"
+        target_close_time = "21:00"
         target_time_obj = datetime.datetime.strptime(target_time, "%H:%M").time()
         target_close_time_obj = datetime.datetime.strptime(target_close_time, "%H:%M").time()
 
@@ -180,12 +196,12 @@ def display_data_tiled(screen, app: IBApp):
 
             if not app.hasOrdersOrPositions("SPX"):
                 app.addToActionLog("Ordering SPX Iron Condor")
-                app.send_iron_condor_order("SPX", 15, 5)
+                app.send_iron_condor_order("SPX", 5, 5)
 
-            if not app.hasOrdersOrPositions("QQQ"):
+            elif not app.hasOrdersOrPositions("QQQ"):
                 app.addToActionLog("Ordering QQQ Iron Condor")
-                app.send_iron_condor_order("QQQ", 2, 2)
-        """
+                app.send_iron_condor_order("QQQ", 2, 1)
+        
 
 
 def display_data_old(screen, app):

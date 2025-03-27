@@ -10,6 +10,34 @@
             "request": "launch",
             "program": "${cwd}/src/main.py",
             "console": "externalTerminal"
+        },
+        {
+            "name": "Debug: predict.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/predict.py",
+            "console": "externalTerminal"
+        },
+        {
+            "name": "LOAD.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/load.py",
+            "console": "externalTerminal"
+        },
+        {
+            "name": "Debug: predict2.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/predict2.py",
+            "console": "externalTerminal"
+        },
+        {
+            "name": "TRAIN",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/trainlarge.py",
+            "console": "externalTerminal"
         }
     ]
 }

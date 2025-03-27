@@ -26,7 +26,7 @@ class IBWrapper(EWrapper):
                 "ConId", "UnderConId", "impliedVol", "optPrice", "pvDividend", "gamma", "vega", "theta", "delta_diff"
             ])
             self.options_data.set_index('Id', inplace=True)
-        self.market_data.set_index('Symbol', inplace=True)
+        self.market_data.set_index('Symbol', inplace=False)
 
 
         self.contract_details = {}
@@ -68,10 +68,19 @@ class IBWrapper(EWrapper):
     def tickOptionComputation(self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice):
         entry = self.req_ids[reqId]
         text = TickTypeEnum.toStr(tickType).lower()
+
         if ("id" in entry):
             id = entry["id"]
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
             with self.optionsDataLock:
+                strike = self.options_data.loc[id, "Strike"]
+
+                if (undPrice is not None and strike is not None):
+                    distance = abs(strike - undPrice)
+
+                    if (distance > 75):
+                        self.cancelMktData(reqId)
+
 
                 self.options_data.loc[id, "impliedVol"] = impliedVol
                 self.options_data.loc[id, "delta"] = delta
