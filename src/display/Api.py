@@ -33,6 +33,24 @@ class Api:
                 return reversed_data.to_html(index=False)  # Convert DataFrame to HTML table
             else:
                 return jsonify({"error": "No data available"}), 400
+            
+        @self.server.route("/api/options", methods=["GET"])
+        def getOptions():
+            data: pd.DataFrame = self.app.options_data
+            if isinstance(data, pd.DataFrame):
+                # Calculate otm distance for non-NaN undPrice for call (C) and put (P)
+                data["otm"] = float('-inf')
+                data.loc[(data["Type"] == "P") & (data["undPrice"].notna()), "otm"] = data["undPrice"] - data["Strike"]
+                data.loc[(data["Type"] == "C") & (data["undPrice"].notna()), "otm"] = data["Strike"] - data["undPrice"]
+
+                # Sort non-NaN undPrice by otm ascending, NaN undPrice last
+                sorted_data = data[data["otm"] > -5].sort_values(by=["otm"], ascending=True, na_position='last')
+                if (len(sorted_data) > 0):
+                    return sorted_data.to_html(index=False)
+                else:
+                    return data.to_html(index=False)
+            else:
+                return jsonify({"error": "No data available"}), 400
 
     def _read_config(self) -> list:
         """Reads the columns configuration from the config file."""

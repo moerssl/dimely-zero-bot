@@ -203,8 +203,8 @@ def start_dash_app(app: IBApp):
                                 line=dict(width=0)
                             ))
 
-                    drawSignal()
-                    #drawSignal("tech_signal", 0.1)
+                    drawSignal(opacity=0.3)
+                    drawSignal("tech_signal", 0.1)
 
                     if ("remaining_intervals" in data.columns) and (row["remaining_intervals"] > 0):
                         if i > 0 and row["remaining_intervals"] > data.loc[i - 1, "remaining_intervals"]:

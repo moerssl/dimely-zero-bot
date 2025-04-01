@@ -124,12 +124,12 @@ class IBWrapper(EWrapper):
             "Type": contractDetails.contract.right,
             "Expiry": contractDetails.contract.lastTradeDate,
             "UnderConId": contractDetails.underConId,
+            "reqId": reqId
             
         }
         with self.optionsDataLock:
             self.options_data.loc[contractDetails.contract.conId] = new_row
 
-    def contractDetailsEnd(self, reqId):
-        return super().contractDetailsEnd(reqId)
+
     
    

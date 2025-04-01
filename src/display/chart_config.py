@@ -115,19 +115,19 @@ def get_chart_config():
                         "type": "line",
                         "name": "SMA5",
                         "columns": {"x": "datetime", "y": "SMA5"},
-                        "style": {"color": "rgba(0, 0, 0, 0.5)", "width": 2}
+                        "style": {"color": "rgba(0, 0, 0, 0.5)", "width": 1}
                     },
                                         {
                         "type": "line",
                         "name": "EMA5",
                         "columns": {"x": "datetime", "y": "EMA5"},
-                        "style": {"color": "rgba(255, 140, 255, 1)", "width": 2}
+                        "style": {"color": "rgba(255, 140, 255, 1)", "width": 1}
                     },
                     {
                         "type": "line",
                         "name": "BB Upper",
                         "columns": {"x": "datetime", "y": "bb_up"},
-                        "style": {"color": "rgba(255, 0, 0, 0.5)", "width": 2}
+                        "style": {"color": "rgba(0, 0, 255, 0.5)", "width": 2}
                     },
                     {
                         "type": "line",
@@ -139,7 +139,7 @@ def get_chart_config():
                         "type": "line",
                         "name": "BB Mid",
                         "columns": {"x": "datetime", "y": "bb_mid"},
-                        "style": {"color": "rgba(0, 125, 255, 0.5)", "width": 1}
+                        "style": {"color": "rgba(0, 0, 255, 0.5)", "width": 2, "dash": "dash"}
                     },
                    
                     {

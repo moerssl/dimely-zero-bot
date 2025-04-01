@@ -101,18 +101,28 @@ async def main():
     api_thread.start()
     sleep(1)
     
+    dash_thread = threading.Thread(target=start_dash_app, args=(app,), daemon=True)
+    dash_thread.start()
+
+    def start_curses_thread(app: IBApp):
+        curses.wrapper(display_data_tiled, app)
+        app.disconnect()
+
+    curses_thread = threading.Thread(target=start_curses_thread, args=(app,), daemon=True)
+    curses_thread.start()
+
     print("Fetching positions and orders...")
     app.fetch_positions()
     app.reqAllOpenOrders()
     
-    symbols = [("VIX", "IND", "CBOE"), ("SPX", "IND", "CBOE")]
+    symbols = [("SPX", "IND", "CBOE"),("VIX", "IND", "CBOE")]
+    optionSymbols = [("SPX", "IND", "CBOE")]
     app.request_market_data(symbols)
-    app.fetch_options_data(symbols)
+    app.fetch_options_data(optionSymbols)
     app.reqHistoricalDataFor("SPX", "IND", "CBOE")
     
-    dash_thread = threading.Thread(target=start_dash_app, args=(app,), daemon=True)
-    dash_thread.start()
-    
+
+    """
     # Wait until IBApp has enough chart data.
     print("Waiting for IBApp to have enough chart data...")
     initial_data = app.get_chart_data()  # For symbol "SPX"
@@ -150,9 +160,8 @@ async def main():
             sleep(1)  # Update every 5 seconds.
     prediction_thread = threading.Thread(target=prediction_updater, daemon=True)
     prediction_thread.start()
+    """
 
-    curses.wrapper(display_data_tiled, app)
-    app.disconnect()
 
 if __name__ == "__main__":
     with keep.running():

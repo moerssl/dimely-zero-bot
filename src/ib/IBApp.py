@@ -34,7 +34,7 @@ logger = getLogger(__name__)
 
 
 class IBApp(IBWrapper, IBClient):
-    def __init__(self, lookBackTime="8 D"):
+    def __init__(self, lookBackTime="8 D", candleSize = "5 mins"):
         self.logger = getLogger(__name__)
         self.market_data_req_ids = {}
         self.market_data_prefix_ids = {}
@@ -63,6 +63,7 @@ class IBApp(IBWrapper, IBClient):
         self.chart_handler: Chart = None
 
         self.lookBackTime = lookBackTime
+        self.candleSize = candleSize
         self.mergePredictThread = None
         self.chartData = None
 
@@ -227,14 +228,17 @@ class IBApp(IBWrapper, IBClient):
 
         return iron_condor_rows
 
-
-
-    def construct_from_underlying(self, symbol, distance=5, wingspan=5):
+    def getPriceForSybol(self, symbol):
         if (symbol not in self.market_data.index):
-            return "No market data available for " + symbol
+            return None
         
         row = self.market_data.loc[symbol]
-        current_price = row["Price"]
+        return row["Price"]
+
+    def construct_from_underlying(self, symbol, distance=5, wingspan=5):
+        current_price = self.getPriceForSybol(symbol)   
+        if current_price is None:
+            return
         with self.optionsDataLock:
             optionsForSymbol = self.options_data[self.options_data["Symbol"] == symbol]
         puts = optionsForSymbol[optionsForSymbol["Type"] == "P"]
@@ -303,6 +307,16 @@ class IBApp(IBWrapper, IBClient):
             {
                 "title": "SPX 30/10  Bull Put",
                 "content": forDisplay(self.build_credit_spread_dollar("SPX", 35, 10, "P"))
+            },
+            {
+                "title": "SPX 125$ Bull Put",
+                "content": forDisplay(self.build_credit_spread_by_premium("SPX", 1.25, "P")),
+                "colspan": 2
+            },
+            {
+                "title": "SPX 125$ Bear Call",
+                "content": forDisplay(self.build_credit_spread_by_premium("SPX", 1.25, "C")),
+                "colspan": 2
             },
             
             {
@@ -374,7 +388,8 @@ class IBApp(IBWrapper, IBClient):
         # Create a copy so that we don't modify the original DataFrame.
         df = df.copy()
         try:
-            
+            if ("day_high_remaining_strike" not in df.columns or "day_low_remaining_strike" not in df.columns):
+                return
             # Initialize a new column 'win' with a default value of False.
             df['win'] = False
             
@@ -476,6 +491,8 @@ class IBApp(IBWrapper, IBClient):
           Bei Signalen, für die nur eine Seite relevant ist, wird die andere Spalte NaN.
         """
         try:
+            if "day_high_remaining" not in df.columns or "day_low_remaining" not in df.columns:
+                return pd.DataFrame()
             df = df.copy()
             # Wandeln final_signal (falls Enum) in einen String um.
             if df['final_signal'].apply(lambda x: hasattr(x, "name")).all():
@@ -544,6 +561,8 @@ class IBApp(IBWrapper, IBClient):
             return pd.DataFrame()
         
     def send_iron_condor_order(self, symbol, distance=5, wingspan=5):
+        if (symbol not in self.market_data.index):
+            return 
         rows = self.construct_from_underlying(symbol, distance, wingspan)
         self.place_combo_order(rows)
 
@@ -581,12 +600,13 @@ class IBApp(IBWrapper, IBClient):
             combo_contract.comboLegs = []
 
             for key, row in contract_rows.items():
-                leg = ComboLeg()
-                leg.conId = row["ConId"]
-                leg.ratio = 1
-                leg.action = "BUY" if "long" in key else "SELL"
-                leg.exchange = "SMART"
-                combo_contract.comboLegs.append(leg)
+                if "long" in key or "short" in key:
+                    leg = ComboLeg()
+                    leg.conId = row["ConId"]
+                    leg.ratio = 1
+                    leg.action = "BUY" if "long" in key else "SELL"
+                    leg.exchange = "SMART"
+                    combo_contract.comboLegs.append(leg)
 
             # Calculate the limit price for the LMT order
             limit_price = 0
@@ -751,6 +771,156 @@ class IBApp(IBWrapper, IBClient):
                 return closest_row
 
         return None
+    def send_credit_spread_by_premium(self, symbol, target_premium, type="C", max_wingspan=10):
+        current_underlying_price = self.getPriceForSybol(symbol)
+        if current_underlying_price is None:
+            return
+        rows = self.find_credit_spread_by_premium(symbol, target_premium, current_underlying_price, type, max_wingspan)
+        self.place_combo_order(rows, 50, None, "PremiumCreditSpread-"+type)
+
+    def find_credit_spread_by_premium(self, symbol, target_premium, current_underlying_price, type="C", max_wingspan=10):
+        """
+        Finds a credit spread for calls or puts such that the net premium 
+        (short bid - long ask) is as close as possible to the target_premium,
+        while ensuring the distance between the strikes does not exceed max_wingspan.
+        
+        For CALL spreads:
+        - Eligible short options: Strike > current_underlying_price.
+        - Valid wing options: Strike greater than short strike but <= short strike + max_wingspan.
+        - OTM distance: Strike_short - current_underlying_price.
+        
+        For PUT spreads:
+        - Eligible short options: Strike < current_underlying_price.
+        - Valid wing options: Strike lower than short strike but >= short strike - max_wingspan.
+        - OTM distance: current_underlying_price - Strike_short.
+        
+        Returns:
+        dict with the details of the selected spread legs and the net credit,
+        or None if no valid spread is found.
+        """
+        import pandas as pd
+
+        # Check if options data is available.
+        if self.options_data.empty:
+            return None
+
+        # Filter options for the given symbol and type.
+        df_symbol = self.filter_options_data(symbol, type)
+        if df_symbol.empty:
+            return None
+        
+        # get rid of NaN prices and -1 prices
+        df_symbol = df_symbol[(df_symbol["bid"] > 0) & (df_symbol["ask"] > 0)]
+
+        # Normalize type and define functions/conditions based on option type.
+        type = type.upper()
+        if type == "C":
+            eligible_condition = df_symbol["Strike"] > current_underlying_price
+            otm_distance_func = lambda s: s - current_underlying_price
+            # For calls: wing must be more than short strike and no more than short + max_wingspan.
+            wing_valid = lambda df: (df["Strike_wing"] > df["Strike_short"]) & (df["Strike_wing"] <= df["Strike_short"] + max_wingspan)
+            short_key, long_key = "short_call", "long_call"
+        elif type == "P":
+            eligible_condition = df_symbol["Strike"] < current_underlying_price
+            otm_distance_func = lambda s: current_underlying_price - s
+            # For puts: wing must be lower than short strike and no lower than short strike - max_wingspan.
+            wing_valid = lambda df: (df["Strike_wing"] < df["Strike_short"]) & (df["Strike_wing"] >= df["Strike_short"] - max_wingspan)
+            short_key, long_key = "short_put", "long_put"
+        else:
+            return None
+
+        # Filter eligible short options.
+        eligible_shorts = df_symbol[eligible_condition].copy()
+        if eligible_shorts.empty:
+            return None
+
+        # Create a cross join between eligible shorts and all wing candidates.
+        eligible_shorts = eligible_shorts.assign(key=1)
+        wings = df_symbol.assign(key=1)
+        pairs = pd.merge(eligible_shorts, wings, on="key", suffixes=('_short', '_wing')).drop("key", axis=1)
+
+        # Retain only valid wing candidates (within the maximum wingspan).
+        pairs = pairs[wing_valid(pairs)]
+        if pairs.empty:
+            return None
+
+        # Compute the net credit for each spread pair (short bid - wing ask)
+        pairs["net_credit"] = pairs["bid_short"] - pairs["ask_wing"]
+
+        # Calculate the absolute premium error
+        pairs["premium_error"] = (pairs["net_credit"] - target_premium).abs()
+
+        # Compute the OTM distance of the short leg
+        pairs["otm_distance"] = otm_distance_func(pairs["Strike_short"])
+
+        # Define a tolerance for the premium error
+        tolerance = 0.02 * target_premium  # 2% of target premium
+
+        # Select candidates within the tolerance range
+        valid_candidates = pairs[pairs["premium_error"] <= tolerance]
+
+        if not valid_candidates.empty:
+            # Among candidates within tolerance, choose the one with the greatest OTM distance
+            new_candidate = valid_candidates.sort_values("otm_distance", ascending=False).iloc[0]
+        else:
+            # Otherwise, sort by premium error first, then by OTM distance
+            new_candidate = pairs.sort_values(by=["premium_error", "otm_distance"], ascending=[True, False]).iloc[0]
+
+        # --- Stability Mechanism ---
+        hysteresis_threshold = 0.01 * target_premium  # 1% of target premium
+
+        if "current_candidate" in locals():
+            # Only switch if new candidate is significantly better
+            if (
+                new_candidate["premium_error"] < current_candidate["premium_error"] - hysteresis_threshold
+                or new_candidate["otm_distance"] > current_candidate["otm_distance"]
+            ):
+                current_candidate = new_candidate  # Accept the new candidate
+            # Otherwise, keep the current candidate
+        else:
+            current_candidate = new_candidate  # First-time assignment
+
+        best_candidate = current_candidate  # The final selection
+
+
+
+        # Extract the short and wing leg rows (with suffixes removed).
+        short_leg = best_candidate[[col for col in best_candidate.index if col.endswith("_short")]]
+        wing_leg = best_candidate[[col for col in best_candidate.index if col.endswith("_wing")]]
+        short_leg = short_leg.rename(lambda x: x.replace("_short", ""))
+        wing_leg = wing_leg.rename(lambda x: x.replace("_wing", ""))
+
+        """
+        # Request market data for both legs.
+        self.request_options_market_data(wing_leg)
+        self.request_options_market_data(short_leg)
+
+        wind_strike = wing_leg["Strike"]
+        short_strike = short_leg["Strike"]
+        if (not np.isnan(wind_strike)):
+            self.request_closest_strike(wing_leg["Symbol"], wind_strike - 5, type)
+            self.request_closest_strike(wing_leg["Symbol"], wind_strike + 5, type)
+        if (not np.isnan(short_strike)):
+            self.request_closest_strike(short_leg["Symbol"], short_strike + 5, type)
+            self.request_closest_strike(short_leg["Symbol"], short_strike - 5, type)"
+        """
+
+        # Return the result, with net_credit as a one-element Series named 'bid'.
+        return {
+            short_key: short_leg,
+            long_key: wing_leg
+        }
+
+
+
+    def build_credit_spread_by_premium(self, symbol, target_premium, type="C", wingspan=10):
+        if (symbol not in self.market_data.index):
+            return 
+        row = self.market_data.loc[symbol]
+        current_price = row["Price"]
+
+        return self.find_credit_spread_by_premium(symbol, target_premium, current_price, type, wingspan)
+
     
     def build_credit_spread_dollar(self, symbol, distance, wingspan, type="C"):
         if (symbol not in self.market_data.index):
@@ -763,7 +933,13 @@ class IBApp(IBWrapper, IBClient):
             target_strike = current_price - distance
         
         return self.find_credit_spread_legs(symbol, target_strike, type, wingspan)
-    
+    def request_closest_strike(self, symbol, target_strike, type="C"):
+        if (self.options_data.empty):
+            return None
+        df_symbol = self.filter_options_data(symbol, type)
+        deltaRow = self.find_closest_strike_row(df_symbol, target_strike, type)
+        self.request_options_market_data(deltaRow)
+
     def find_credit_spread_legs(self, symbol, short_strike, type="C", wingspan=10):
         if (self.options_data.empty):
             return None
@@ -951,7 +1127,8 @@ class IBApp(IBWrapper, IBClient):
             self.market_data_req_ids[reqId] = { "symbol": symbol, "prefix": prefix }
             self.addToActionLog("Requesting historical data for " + symbol + " "+ str(reqId ))
             print("Requesting historical data for " + whatToShow + " " + symbol + " "+ str(reqId ), lookBackTime)
-            self.reqHistoricalData(reqId, contract, "", lookBackTime, "5 mins", whatToShow, 1, 2, upToDate, [])
+            
+            self.reqHistoricalData(reqId, contract, "", lookBackTime, self.candleSize, whatToShow, 1, 2, upToDate, [])
         
             # self.reqHistoricalData(reqId, contract, "", self.lookBackTime, "5 mins", "TRADES", 1, 1, True, [])
             time.sleep(1)  # To avoid pacing violations
@@ -975,22 +1152,8 @@ class IBApp(IBWrapper, IBClient):
             prefix = self.market_data_req_ids[reqId]["prefix"]
 
             print(f"Received historicalData for reqId: {reqId} symbol: {symbol} prefix: {prefix}", end="\r")
+            self.initDataFrame(symbol)
             with self.candleLock:
-                # Initialize DataFrame if the symbol is not yet present
-                if symbol not in self.candleData:
-                    # Generate all possible columns with and without prefixes
-                    prefixes = [p[1] for p in self.marketDataPrefix]
-                    base_columns = ["date", "open", "close", "high", "low", "volume", "wap", "count"]
-                    columns = ["date", "open", "close", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist_p", "p_dist_p", "final_signal", "tech_signal", "high", "low",  "volume", "wap", "count"]
-
-                    for pre in prefixes:
-                        for col in base_columns:
-                            colName = f"{pre}{col}" if pre else col
-                            if colName not in columns:
-                                columns.append(colName)
-                            
-                    self.candleData[symbol] = pd.DataFrame(columns=columns)
-
                 # Prepare bar data with the appropriate prefix
                 bar_data = {
                     f"date": bar.date,
@@ -1096,7 +1259,30 @@ class IBApp(IBWrapper, IBClient):
     def saveCandle(self):
         with self.candleLock:
             for symbol, df in self.candleData.items():
-                df.to_csv(f"{symbol}_candle.csv", index=False)
+                file_path = f"{symbol}_candle.csv"
+                try:
+                    # Create or overwrite the file every time
+                    df.to_csv(file_path, index=False)
+                    self.addToActionLog(f"File {file_path} created/overwritten successfully.")
+                except Exception as e:
+                    self.addToActionLog(f"An error occurred while creating {file_path}: {e}")
+    
+    def initDataFrame(self, symbol):
+        with self.candleLock:
+            # Initialize DataFrame if the symbol is not yet present
+            if symbol not in self.candleData:
+                # Generate all possible columns with and without prefixes
+                prefixes = [p[1] for p in self.marketDataPrefix]
+                base_columns = ["date", "open", "close", "high", "low", "volume", "wap", "count"]
+                columns = ["date", "open", "close", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist_p", "p_dist_p", "final_signal", "tech_signal", "high", "low",  "volume", "wap", "count"]
+
+                for pre in prefixes:
+                    for col in base_columns:
+                        colName = f"{pre}{col}" if pre else col
+                        if colName not in columns:
+                            columns.append(colName)
+                        
+                self.candleData[symbol] = pd.DataFrame(columns=columns)
 
     def loadCandle(self):
             for symbol in ["SPX"]:
@@ -1120,3 +1306,33 @@ class IBApp(IBWrapper, IBClient):
                     return (datetime.now() - pd.to_datetime(last["date"])).total_seconds()
             return None
 
+    @iswrapper
+    def contractDetailsEnd(self, reqId):
+        contract: Contract = self.contract_details[reqId]
+        symbol = contract.symbol
+
+        #Check for underlying price
+        current_price = self.getPriceForSybol(symbol)   
+        if current_price is None:
+            return
+        
+        optionsForSymbol = self.options_data[self.options_data["Symbol"] == symbol]
+        calls = optionsForSymbol[optionsForSymbol["Type"] == "C"]
+        puts = optionsForSymbol[optionsForSymbol["Type"] == "P"]
+
+        minDistance = -5
+        maxDistance = 80
+
+        # vector find puts and calls in distance
+        callsInDistance = calls[(calls["Strike"] - current_price) <= maxDistance]
+        callsInDistance = callsInDistance[(callsInDistance["Strike"] - current_price) >= minDistance]
+        putsInDistance = puts[(current_price - puts["Strike"]) <= maxDistance]
+        putsInDistance = putsInDistance[(current_price - putsInDistance["Strike"]) >= minDistance]
+
+        # request market data for each option in distance
+        for index, row in callsInDistance.iterrows():
+            self.request_options_market_data(row)
+        for index, row in putsInDistance.iterrows():
+            self.request_options_market_data(row)
+
+        return super().contractDetailsEnd(reqId)

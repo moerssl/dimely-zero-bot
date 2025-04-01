@@ -3,6 +3,7 @@ import curses
 
 import curses
 import datetime
+from time import sleep
 
 import pandas as pd
 import talib
@@ -23,8 +24,8 @@ def display_data_tiled(screen, app: IBApp):
     def saveCandles():
         app.saveCandle()
 
-    schedule.every(30).seconds.do(catch_up)    
-    schedule.every(1).minutes.do(saveCandles)
+    schedule.every(150).seconds.do(catch_up)    
+    schedule.every(5).minutes.do(saveCandles)
 
     display_data = True
     while True:
@@ -159,29 +160,35 @@ def display_data_tiled(screen, app: IBApp):
                 if i < height:
                     screen.addstr(i, 0, line[:width])
 
+        try:
+            # Refresh the screen
+            screen.refresh()
+            key = screen.getch()
 
-        # Refresh the screen
-        screen.refresh()
-        key = screen.getch()
+            # Check for escape key press
+            if key == 27:  # Escape key
+                #app.save_models()
+                break
 
-        # Check for escape key press
-        if key == 27:  # Escape key
-            #app.save_models()
-            break
+            if key == ord('V'):
+                display_data = not display_data
 
-        if key == ord('v'):
-            display_data = not display_data
+            if key == ord('P'):
+                app.addToActionLog("P key pressed")
+                app.send_credit_spread_order("SPX", 0.15, "P")
 
-        if key == ord('p'):
-            app.addToActionLog("P key pressed")
-            app.send_credit_spread_order("SPX", 0.15, "P")
-
-        if key == ord('c'):
-            app.addToActionLog("C key pressed")
-            app.send_credit_spread_order("SPX", 0.15, "C")
-        if key == ord('i'):
-            app.addToActionLog("C key pressed")
-            app.send_iron_condor_order("SPX", 5, 5)
+            if key == ord('C'):
+                app.addToActionLog("C key pressed")
+                app.send_credit_spread_order("SPX", 0.15, "C")
+            if key == ord('I'):
+                app.addToActionLog("i key pressed")
+                app.send_iron_condor_order("SPX", 5, 5)
+            if key == ord('M'):
+                app.addToActionLog("m key pressed")
+                app.send_credit_spread_by_premium("SPX", 1.25, "C")
+                app.send_credit_spread_by_premium("SPX", 1.25, "P")
+        except Exception as e:
+            app.addToActionLog(f"Error: {e}")
 
         
         target_time = "20:55"
@@ -219,6 +226,7 @@ def display_data_old(screen, app):
         print(data)
         # Get screen dimensions
         height, width = screen.getmaxyx()
+
         third_width = width // len(data)
 
         for j, tile in enumerate(data):

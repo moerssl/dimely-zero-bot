@@ -6,7 +6,7 @@ CONFIG = {
         "ema_timeperiod": 5,
         "rsi_timeperiod": 14,
         "macd": {"fastperiod": 12, "slowperiod": 26, "signalperiod": 9},
-        "bbands": {"timeperiod": 20, "nbdevup": 2, "nbdevdn": 2, "matype": talib.MA_Type.EMA},
+        "bbands": {"timeperiod": 40, "nbdevup": 2, "nbdevdn": 2, "matype": talib.MA_Type.EMA},
         "adx_timeperiod": 5,
         "atr_timeperiod": 78,
     },
@@ -25,6 +25,6 @@ CONFIG = {
         "candle_interval": 5,  # minutes per candle
     },
     "default_strike_offset": 35,
-    "default_strike_offset_put": 40,
+    "default_strike_offset_put": 50,
     "default_strike_offset_call": 35,
 }
