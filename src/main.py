@@ -4,7 +4,7 @@ from time import sleep
 from ib.IBApp import IBApp
 import curses
 
-from display.tiled import display_data, display_data_old, display_data_tiled
+from display.tiled import display_data_tiled
 from display.dash_app import start_dash_app
 from util.Chart import Chart
 

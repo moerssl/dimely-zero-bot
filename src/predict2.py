@@ -20,6 +20,7 @@ if physical_devices:
 
 # Import your IBApp and related modules.
 from ib.IBApp import IBApp
+from ib.TwsOrderAdapter import TwsOrderAdapter
 from display.tiled import display_data_tiled
 from display.dash_app import start_dash_app
 from util.Chart import Chart
@@ -92,34 +93,55 @@ def update_chart_predictions(app: IBApp, predictor: HighLowPredictor):
 async def main():
     # Initialize IBApp and connect.
     app = IBApp()
+    historyApp = IBApp(lookBackTime="8 D")
+    orderApp = TwsOrderAdapter()
+    orderApp.actionLog = app.actionLog
+    focusSymbol = ("SPY", "STK", "SMART")
+    secondarySymbol = ("SPX", "IND", "CBOE")
+    vix = ("VIX", "IND", "CBOE")
+
+    historyCandles = {}
+
+    app.candleData = historyCandles
+    historyApp.candleData = historyCandles
     print("Connecting to TWS/IB Gateway...")
     app.connect("127.0.0.1", 7497, clientId=1)  # Use your connection parameters.
+    orderApp.connect("127.0.0.1", 7497, clientId=2)  # Use your connection parameters.
+    historyApp.connect("127.0.0.1", 7497, clientId=3)  # Use your connection parameters.
     
-    def run_loop():
-        app.run()
-    api_thread = threading.Thread(target=run_loop, daemon=True)
+    def run_loop(client):
+        client.run()
+    api_thread = threading.Thread(target=run_loop, daemon=True, args=(app,))
     api_thread.start()
-    sleep(1)
+    sleep(0.1)
+    order_thread = threading.Thread(target=run_loop, daemon=True, args=(orderApp,))
+    order_thread.start()
+    sleep(0.1)
+    history_thread = threading.Thread(target=run_loop, daemon=True, args=(historyApp,))
+    history_thread.start()
     
-    dash_thread = threading.Thread(target=start_dash_app, args=(app,), daemon=True)
+    dash_thread = threading.Thread(target=start_dash_app, args=(historyApp,orderApp,), daemon=True)
     dash_thread.start()
 
-    def start_curses_thread(app: IBApp):
-        curses.wrapper(display_data_tiled, app)
+    def start_curses_thread(app: IBApp, orderApp: TwsOrderAdapter):
+        curses.wrapper(display_data_tiled, app, orderApp, historyApp, focusSymbol)
         app.disconnect()
 
-    curses_thread = threading.Thread(target=start_curses_thread, args=(app,), daemon=True)
+    curses_thread = threading.Thread(target=start_curses_thread, args=(app,orderApp,), daemon=True)
     curses_thread.start()
+
+    app.setMarketDataType()
 
     print("Fetching positions and orders...")
     app.fetch_positions()
     app.reqAllOpenOrders()
     
-    symbols = [("SPX", "IND", "CBOE"),("VIX", "IND", "CBOE")]
-    optionSymbols = [("SPX", "IND", "CBOE")]
+    symbols = [focusSymbol,secondarySymbol,vix]
+    optionSymbols = [focusSymbol]
     app.request_market_data(symbols)
     app.fetch_options_data(optionSymbols)
-    app.reqHistoricalDataFor("SPX", "IND", "CBOE")
+    historyApp.reqHistoricalDataFor(*vix, False, "2 D", "1 day")
+    historyApp.reqHistoricalDataFor(*focusSymbol)
     
 
     """

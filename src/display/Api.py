@@ -1,8 +1,10 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, url_for
+from flask import request
 import pandas as pd
+import traceback
 
 class Api:
-    def __init__(self, server: Flask, app, config_file: str):
+    def __init__(self, server: Flask, app, orderApp, config_file: str):
         self.server = server
         self.app = app
         self.config_file = config_file
@@ -14,10 +16,15 @@ class Api:
             if isinstance(chart_data, pd.DataFrame):
                 chart_data = chart_data.iloc[::-1]
                 return chart_data.to_html(index=False)
-
+            
+            
         @self.server.route("/api/candle", methods=["GET"])
-        def getCandle():
-            """Endpoint to fetch chart data."""
+        def getCandleFb():
+            return self.getCandle("SPY")
+
+        @self.server.route("/api/candle/<string:symbol>", methods=["GET"])
+        def getCandle(symbol):
+            """Endpoint to fetch chart data for a given symbol."""
             # Load the columns configuration from the file
             columns_to_display = self._read_config()
 
@@ -33,6 +40,8 @@ class Api:
                 return reversed_data.to_html(index=False)  # Convert DataFrame to HTML table
             else:
                 return jsonify({"error": "No data available"}), 400
+
+
             
         @self.server.route("/api/options", methods=["GET"])
         def getOptions():
@@ -51,6 +60,73 @@ class Api:
                     return data.to_html(index=False)
             else:
                 return jsonify({"error": "No data available"}), 400
+
+        @self.server.route("/api/positions", methods=["GET"])
+        def getPositions():
+            """Endpoint to fetch positions."""
+            data = orderApp.positions
+            df = pd.DataFrame(data.values())
+            return df.to_html(index=False)
+
+        @self.server.route("/api/orders", methods=["GET"])
+        def getOrders():
+            """Endpoint to fetch orders."""
+            data: dict = orderApp.apiOrders
+
+            df = pd.DataFrame(data.values())
+            return self.toJsonOrHtml(df)
+        
+        @self.server.route("/api/orders/contracts", methods=["GET"])
+        def getOrderContracts():
+            """Endpoint to fetch orders."""
+            data: dict = orderApp.orderContracts
+
+            df = pd.DataFrame(data.values())
+            return self.toJsonOrHtml(df)
+        
+        @self.server.route('/routes', methods=['GET'])
+        def show_routes():
+            try:
+                routes_html = "<h1>Available Routes</h1><ul>"
+                errors = []
+                for rule in self.server.url_map.iter_rules():
+                    if "GET" in rule.methods:  # Only include routes accessible via GET method
+                        try:
+                            route_url = url_for(rule.endpoint)  # Generate a URL for the route
+                            routes_html += f'<li><a href="{route_url}">{route_url}</a></li>'
+                        except Exception as e:
+                            errors.append(f"Error generating URL for {rule.endpoint}: {e}")
+                            continue
+                if errors:
+                    routes_html += "<h2>Errors:</h2><ul>"
+                    for error in errors:
+                        routes_html += f"<li>{error}</li>"
+                    routes_html += "</ul>"
+                routes_html += "</ul>"
+                return routes_html
+            except Exception as e:
+                return f"Error generating routes: {e}", 500
+            
+        @self.server.errorhandler(Exception)
+        def handle_exception(e):
+            """Handle all uncaught exceptions and return a detailed error message."""
+            response = {
+                "error": str(e),  # Brief error message
+                "details": traceback.format_exc(),  # Full traceback for debugging
+            }
+            return jsonify(response), 500
+
+    def toJsonOrHtml(self, data: pd.DataFrame) -> str:
+        # read accept header from request with html default
+        accept_header = request.headers.get("Accept", "text/html")
+
+        if "application/json" in accept_header:
+            return data.to_json(orient="records")
+        elif "text/html" in accept_header:
+            return data.to_html(index=False)
+        else:
+            return data.to_csv(index=False)
+        
 
     def _read_config(self) -> list:
         """Reads the columns configuration from the config file."""

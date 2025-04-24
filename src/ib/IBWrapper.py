@@ -3,6 +3,7 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract, ContractDetails
 from ibapi.ticktype import TickType, TickTypeEnum
 from ibapi.order import Order
+from data.ExpectedValueTrader import ExpectedValueTrader
 
 from ibapi.utils import iswrapper
 from ibapi.common import *
@@ -10,6 +11,7 @@ import pandas as pd
 import time
 from datetime import datetime, timedelta
 from threading import RLock
+import numpy as np
 
 class IBWrapper(EWrapper):
     def __init__(self, market_data_dict):
@@ -21,8 +23,8 @@ class IBWrapper(EWrapper):
         self.market_data = pd.DataFrame(columns=["Symbol", "DateTime", "Price"])
         with self.optionsDataLock:
             self.options_data = pd.DataFrame(columns=[
-                "Id", "Symbol", "Strike", "undPrice", "Type", "delta", "bid", "ask", "Expiry",
-                "close", "last", "high", "low",
+                "Id", "Symbol", "Strike", "dist", "undPrice", "Type", "delta", "bid", "ask", "bid_size", "ask_size", "last", "Expiry",
+                "close", "high", "low",
                 "ConId", "UnderConId", "impliedVol", "optPrice", "pvDividend", "gamma", "vega", "theta", "delta_diff"
             ])
             self.options_data.set_index('Id', inplace=True)
@@ -30,6 +32,7 @@ class IBWrapper(EWrapper):
 
 
         self.contract_details = {}
+        self.evTrader = ExpectedValueTrader(self.options_data)
 
     @iswrapper
     def position(self, account: str, contract: Contract, position: float, avgCost: float):
@@ -74,12 +77,19 @@ class IBWrapper(EWrapper):
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
             with self.optionsDataLock:
                 strike = self.options_data.loc[id, "Strike"]
+                type = self.options_data.loc[id, "Type"]
 
                 if (undPrice is not None and strike is not None):
                     distance = abs(strike - undPrice)
+                    percentage = undPrice * 0.05
 
-                    if (distance > 75):
-                        self.cancelMktData(reqId)
+                    self.options_data.loc[id, "dist"] = round(distance / undPrice * 100,2) 
+
+                    if (distance > percentage):
+                        self.cancel_options_market_data({"Id": id})
+
+                
+                
 
 
                 self.options_data.loc[id, "impliedVol"] = impliedVol
@@ -90,6 +100,7 @@ class IBWrapper(EWrapper):
                 self.options_data.loc[id, "vega"] = vega
                 self.options_data.loc[id, "theta"] = theta
                 self.options_data.loc[id, "undPrice"] = undPrice
+                
 
         return super().tickOptionComputation(reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice)
     
@@ -109,9 +120,51 @@ class IBWrapper(EWrapper):
             id = entry["id"]
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
             with self.optionsDataLock:
+                if text.startswith("delayed_"):
+                      delayed_text = text[len("delayed_"):]
+                      val =  self.options_data.loc[id, delayed_text]
+                      if not (val > 0):
+                          text = delayed_text
                 self.options_data.loc[id, text] = price
 
+    @iswrapper
+    def tickSize(self, reqId, tickType, size):
+        entry = self.req_ids[reqId]
+        text = TickTypeEnum.toStr(tickType).lower()
 
+        if ("id" in entry):
+            id = entry["id"]
+            #print("Tick Size. Ticker Id:", reqId, "Id:", id, "Type:", text, "Size:", size)
+            with self.optionsDataLock:             
+                if text.startswith("delayed_"):
+                      delayed_text = text[len("delayed_"):]
+                      val =  self.options_data.loc[id, delayed_text]
+                      if not (val > 0):
+                          text = delayed_text
+
+                self.options_data.loc[id, text] = size
+        return super().tickSize(reqId, tickType, size)
+    def cleanPrices(self):
+        # Check if the necessary columns are in the DataFrame
+        required_columns = ['bid', 'ask', 'last', 'close']
+        missing_columns = [col for col in required_columns if col not in self.options_data.columns]
+        if missing_columns:
+            return
+
+        # Update 'bid' and 'ask' without loops:
+        # For each row, if bid (or ask) is >= 0, keep it; 
+        # otherwise, if last is >= 0, use last; else, use close.
+        self.options_data['bid'] = np.where(
+            (self.options_data['bid'] >= 0),
+            self.options_data['bid'],
+            np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
+        )
+        self.options_data['ask'] = np.where(
+            (self.options_data['ask'] >= 0),
+            self.options_data['ask'],
+            np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
+        )
+        
     @iswrapper
     def contractDetails(self, reqId: int, contractDetails: ContractDetails):
         

@@ -1,4 +1,4 @@
-from dash import Dash, dcc, html, no_update
+from dash import Dash, dcc, html
 from dash.dependencies import Input, Output, State
 import plotly.graph_objects as go
 import importlib  # To dynamically reload the chart config
@@ -12,9 +12,6 @@ import threading
 def start_dash_app(app: IBApp, orderApp):
     dash_app = Dash(__name__)
     flaskApi = Api(dash_app.server, app, orderApp, "candle-config.txt")
-
-    render_lock = threading.Lock()  # Add this line
-
 
     def load_chart_config():
         importlib.reload(chart_config)  # Dynamically reload the chart config
@@ -30,7 +27,7 @@ def start_dash_app(app: IBApp, orderApp):
             ),
             dcc.Interval(
                 id="interval-component",
-                interval=2000,  # Refresh every 1 second
+                interval=10000,  # Refresh every 1 second
                 n_intervals=0
             )
         ]
@@ -42,10 +39,6 @@ def start_dash_app(app: IBApp, orderApp):
         [State("candlestick-chart", "relayoutData")]  # Preserve zoom and layout
     )
     def update_chart(n, relayout_data):
-        if not render_lock.acquire(blocking=False):
-            # If we can't acquire the lock, skip this update
-            return no_update
-
         fig = go.Figure()
 
         try:
@@ -298,8 +291,6 @@ def start_dash_app(app: IBApp, orderApp):
                     fig.update_yaxes(autorange=True)
         except Exception as e:
             print("Error in update_chart callback:", e)
-        finally:
-            render_lock.release()  # Always release the lock
         
         # If something goes wrong or no valid trace is drawn, return an empty figure.
         return fig

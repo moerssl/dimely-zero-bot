@@ -1,5 +1,6 @@
 def get_chart_config():
     return {
+        "symbol": "SPY",
         "subplots": [
 
             {

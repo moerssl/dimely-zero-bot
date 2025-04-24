@@ -75,6 +75,9 @@ def calc_ta_indicators(df, cfg):
     df["hammer"] = talib.CDLHAMMER(open_arr, high_arr, low_arr, close_arr)
     df["adx"] = talib.ADX(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
     
+    # Create a new column for the gap
+    df['night_gap'] = df['open'] - df['close'].shift(1)
+    
     return df
 
 # 3. Compute ATR and volatility-based measures
@@ -172,6 +175,13 @@ def calc_daily_volatility(df, cfg):
     df["remaining_std_dev"] = remaining_std_dev
     return df, current_price, remaining_std_dev
 
+def getStepSize(symbol):
+    multiplier = 1.0
+    if symbol == "SPX":
+        multiplier = 5.0
+
+    return multiplier
+
 # 9. Assign strikes (note: relies on self.get_closest_delta_row; adjust as needed)
 def assign_strikes(df, current_price, default_offset_put, default_offset_call, getStrikeFunc = None, symbol = None):
     if "put_strike" not in df.columns:
@@ -179,6 +189,8 @@ def assign_strikes(df, current_price, default_offset_put, default_offset_call, g
     if "call_strike" not in df.columns:
         df["call_strike"] = np.nan
     # Here, we assume get_closest_delta_row is available as a method in the calling object.
+    
+    """
     if (getStrikeFunc is not None):
         latestPutRow = getStrikeFunc(symbol, 0.15, "P")
         latestCallRow = getStrikeFunc(symbol, 0.15, "C")
@@ -189,8 +201,12 @@ def assign_strikes(df, current_price, default_offset_put, default_offset_call, g
         df.iloc[-1, df.columns.get_loc("put_strike")] = latestPutRow["Strike"]
     if latestCallRow is not None:
         df.iloc[-1, df.columns.get_loc("call_strike")] = latestCallRow["Strike"]
-    df["put_strike"] = df["put_strike"].fillna(current_price - default_offset_put).apply(adjust_low)
-    df["call_strike"] = df["call_strike"].fillna(current_price + default_offset_call).apply(adjust_high)
+    """
+    step = getStepSize(symbol)
+
+    df["put_strike"] = (current_price - default_offset_put).apply(adjust_low, args=(step,))
+    #df["put_strike"] = df["put_strike"].apply(adjust_low, args=(5,))
+    df["call_strike"] = (current_price + default_offset_call).apply(adjust_high, args=(step,))
     return df
 
 # 10. Compute probability-based indicators using Z-scores
@@ -265,13 +281,13 @@ def combine_signals(df):
     final_signal = np.where(
         (previous_tech_signal == StrategyEnum.SellPut) &
         (tech_signal == StrategyEnum.Hold) &
-        (df["call_p"].values >= prob_theshold) &
+        (df["put_p"].values >= prob_theshold) &
         (df["ATR_percent"].values < 0.3),
         StrategyEnum.SellPut,
         np.where(
             (previous_tech_signal == StrategyEnum.SellCall) &
             (tech_signal == StrategyEnum.Hold) &
-            (df["put_p"].values >= prob_theshold) &
+            (df["call_p"].values >= prob_theshold) &
             (df["ATR_percent"].values < 0.3),
             StrategyEnum.SellCall,
             np.where(
@@ -288,11 +304,11 @@ def combine_signals(df):
     return df
 
 # 12. Adjust strikes based on previous values
-def adjust_strikes(df):
+def adjust_strikes(df, symbol = None):
+    step = getStepSize(symbol)
     
-    
-    df['day_high_remaining_strike'] = df['day_high_remaining'].apply(adjust_high)
-    df['day_low_remaining_strike'] = df['day_low_remaining'].apply(adjust_low)
+    df['day_high_remaining_strike'] = df['day_high_remaining'].apply(adjust_high, args=(step,))
+    df['day_low_remaining_strike'] = df['day_low_remaining'].apply(adjust_low, args=(step,))
     
     
     if "final_signal" not in df.columns:
@@ -310,15 +326,15 @@ def adjust_strikes(df):
     )
     return df
 
-def adjust_high(x):
+def adjust_high(x, m = 5):
     try:
-        return math.ceil(x / 5) * 5
+        return math.ceil(x / m) * m
     except Exception:
         return x
 
-def adjust_low(x):
+def adjust_low(x, m = 5):
     try:
-        return math.floor(x / 5) * 5
+        return math.floor(x / m) * m
     except Exception:
         return x
 
@@ -333,6 +349,15 @@ def addIndicatorsForSymbol(self, symbol):
     with self.candleLock:
         self.candleData[symbol] = addIndicatorsOn(self.candleData[symbol])
 
+def determineStrikeOffsets(self, symbol):
+    if symbol in CONFIG["offsets"]:
+        call_offset = CONFIG["offsets"][symbol]["call"]
+        put_offset = CONFIG["offsets"][symbol]["put"]
+    else:
+        call_offset = CONFIG["default_strike_offset_call"]
+        put_offset = CONFIG["default_strike_offset_put"]
+    return call_offset, put_offset
+
 def addIndicatorsOn(self, df, symbol = None):
     df = parse_datetime(df)  # Step 1
     df = calc_ta_indicators(df, CONFIG)  # Step 2
@@ -342,11 +367,14 @@ def addIndicatorsOn(self, df, symbol = None):
     df = calc_time_indicators(df, CONFIG)  # Step 6
     df = checkDayRange(df)  # Step 7
     df, current_price, remaining_std_dev = calc_daily_volatility(df, CONFIG)  # Step 8
+
+    call_offset, put_offset = determineStrikeOffsets(self, symbol)
+
     if (symbol is not None):
-        df = assign_strikes(df, current_price, CONFIG["default_strike_offset_put"], CONFIG["default_strike_offset_call"],  None, symbol)  # Step 9 (uses self.get_closest_delta_row)
+        df = assign_strikes(df, current_price, put_offset, call_offset,  None, symbol)  # Step 9 (uses self.get_closest_delta_row)
         df = calc_probabilities(df, current_price, remaining_std_dev)  # Step 10
     df = combine_signals(df)  # Step 11
-    df = adjust_strikes(df)  # Step 12
+    df = adjust_strikes(df, symbol)  # Step 12
     return df
 
 def aggregate_rsi_ranges(df, rsi_column, smoothing_window=5, order=10,

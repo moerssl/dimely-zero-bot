@@ -1,0 +1,20 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Run predict2.py",
+            "type": "shell",
+            "command": "python ${workspaceFolder}/src/predict2.py",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "showReuseMessage": false,
+                "clear": false,
+                "external": true
+            }
+        }
+    ]
+}

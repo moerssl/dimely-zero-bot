@@ -28,6 +28,12 @@ from util.StrategyEnum import StrategyEnum
 from util.AdaptiveDataframeProcessor import AdaptiveDataframeProcessor
 import util.TaAnalysisHelper as tah
 from util.config import CONFIG
+from ib.TwsOrderAdapter import TwsOrderAdapter
+from data.ExpectedValueTrader import ExpectedValueTrader
+
+from datetime import datetime
+from pytz import timezone
+import math
 
 logger = getLogger(__name__)
 # logger.setLevel("INFO")
@@ -44,10 +50,11 @@ class IBApp(IBWrapper, IBClient):
         self.actionLog = []
         self.next_order_id = None
         self.last_used_order_id = None
+        self.lastRequestedDateForContracts = None
         IBWrapper.__init__(self, self.market_data_req_ids)
         IBClient.__init__(self, self)
         self.reqId = 0
-        self.cond = Condition()
+        # self.cond = Condition()
         
         self.apiOrderLock = RLock()
         self.candleLock = RLock()
@@ -69,9 +76,11 @@ class IBApp(IBWrapper, IBClient):
 
         self.marketDataPrefix = [
             ("TRADES", "", True),
-            ("HISTORICAL_VOLATILITY", "HV_", False),
+            #("HISTORICAL_VOLATILITY", "HV_", False),
             ("OPTION_IMPLIED_VOLATILITY", "IV_", False),
         ]
+
+        self.lastContractsDataUpdatedAt = None
 
         """
         self.loadCandle()
@@ -79,29 +88,53 @@ class IBApp(IBWrapper, IBClient):
         if (distance is not None and distance < 86000):
             self.lookBackTime = str(int(distance)) + " S"
         """
+    def get_offset_configs(self, symbol):
+        try:
+            if symbol in CONFIG["offsets"]:
+                return CONFIG["offsets"][symbol]["call"], CONFIG["offsets"][symbol]["put"], CONFIG["offsets"][symbol]["wing_span"], CONFIG["offsets"][symbol]["target_premium"], CONFIG["offsets"][symbol]["late_ic_windspan"], CONFIG["tpFromLimit"], CONFIG["slFromLimit"]
+            else:
+                return CONFIG["default_strike_offset_call"], CONFIG["default_strike_offset_put"], CONFIG["default_wing_span"], CONFIG["default_target_premium"], CONFIG["default_late_ic_windspan"], CONFIG["tpFromLimit"], CONFIG["slFromLimit"]
+        except Exception as e:
+            print(f"Error getting offset configs for {symbol}: {e}")
+            return None, None, None, None, None    
 
+    def setMarketDataType(self):
+        if (self.is_nyse_open()):
+            self.reqMarketDataType(1)
+        else:
+            self.reqMarketDataType(4)
+
+    def is_nyse_open(self):
+        # Define NYSE working hours in Eastern Time
+        nyse_open_hour = 9  # 9:30 AM
+        nyse_open_minute = 30
+        nyse_close_hour = 16  # 4:00 PM
+
+        # Time zone for NYSE (Eastern Time)
+        nyse_tz = timezone('US/Eastern')
+
+        # Get current time in NYSE's timezone
+        now_nyse = datetime.now(nyse_tz)
+
+        # Check if current time is within NYSE hours
+        nyse_open = now_nyse.replace(hour=nyse_open_hour, minute=nyse_open_minute, second=0, microsecond=0)
+        nyse_close = now_nyse.replace(hour=nyse_close_hour, minute=0, second=0, microsecond=0)
+
+        return nyse_open <= now_nyse < nyse_close
+
+    
     def nextReqId(self):
         self.reqId += 1
         return self.reqId
     
-    def nextOrderId(self):
-        with self.cond:
-            self.reqIds(-1)
-            # Wait for the next valid order ID
-            while self.next_order_id is None or self.next_order_id == self.last_used_order_id:
-                self.cond.wait()
-            self.last_used_order_id = self.next_order_id
-            self.next_order_id = None
-        return self.last_used_order_id
-
     @iswrapper
     def nextValidId(self, orderId: int):
         self.addToActionLog("Next Valid ID: " + str(orderId))
         self.next_order_id = orderId
 
         # Notify the waiting thread
-        with self.cond:
-            self.cond.notify()
+        #with self.cond:
+        #    self.cond.notify()
 
     def addToActionLog(self, action):
         with self.actionLock:
@@ -131,7 +164,13 @@ class IBApp(IBWrapper, IBClient):
             return
         
         req = self.option_id_req[options_data["Id"]]
+        req = self.option_id_req.get(options_data["Id"], None)
+
+        if req is None or req in self.market_data_req_ids:
+            return
+        
         self.cancelMktData(req)
+        del self.market_data_req_ids[req]
     
     def request_options_market_data(self,options_data):
         if (options_data is None):
@@ -157,19 +196,24 @@ class IBApp(IBWrapper, IBClient):
         time.sleep(0.1)  # To avoid pacing violations
 
 
-    def fetch_options_data(self, symbols):
+    def fetch_options_data(self, symbols, date: datetime = datetime.today()):
+        self.lastRequestedDateForContracts = date
         for i, symbol_type in enumerate(symbols):
             symbol, type,ex = symbol_type
 
             for right in ["C", "P"]:
+                req = self.nextReqId()
+
                 contract = Contract()
                 contract.symbol = symbol
                 contract.secType = "OPT"
                 contract.currency = "USD"
                 contract.exchange = "SMART"
-                contract.lastTradeDateOrContractMonth = datetime.today().strftime("%Y%m%d")
+                contract.lastTradeDateOrContractMonth = date.strftime("%Y%m%d")
                 contract.right = right
-                self.reqContractDetails(i, contract)
+                self.market_data_req_ids[req] = { "date": date, "symbols": symbols }
+                self.reqContractDetails(req, contract)
+                
                 time.sleep(0.1)  # To avoid pacing violations
 
     def find_iron_condor_legs(self, puts, calls, current_price, distance=5, wingspan=5):
@@ -247,7 +291,7 @@ class IBApp(IBWrapper, IBClient):
         return self.find_iron_condor_legs(puts, calls, current_price,distance, wingspan)
 
 
-    def getTilesData(self):
+    def getTilesData(self, symbol):
         def forDisplay(rows):
             """
             This function takes a dictionary where each entry is a dataframe row
@@ -273,7 +317,34 @@ class IBApp(IBWrapper, IBClient):
             else:
                 
                 return  pd.DataFrame()
-            
+        
+        def defineSpreadTile(title, spread, colspan=None, tpAtLmt = 1):
+            tp = 1 - tpAtLmt
+            price = TwsOrderAdapter.calcSpreadPrice(spread)
+            risk = TwsOrderAdapter.calcMaxRisk(spread, price)
+            ev, evs = "N/A", "N/A"
+            if (price is not None and price <= -0.2):
+                ev = ExpectedValueTrader.calcExpectedValue(spread, tp)
+                evs = ExpectedValueTrader.calcExpectedValue(spread, tp, simple=True)
+            if price is not None and not math.isnan(price):
+                price = round(price, 2)
+            content = forDisplay(spread)
+            title = title + " | lmt: " + str(price) + " | r: " +str(risk) + " | EV:" + str(ev)+ " | EVs:" + str(evs)
+
+            ret = {
+                "title": title,
+                "content": content
+            }
+
+            if (colspan):
+                ret["colspan"] = colspan
+
+            return ret
+        
+        callDistance, putDistance, wing_span, target_premium, ic_wingspan, tp, sl = self.get_offset_configs(symbol)
+
+        tp = tp / 100 
+        sl = sl / 100
         return [
             {
                 "title": "Market Data",
@@ -288,75 +359,52 @@ class IBApp(IBWrapper, IBClient):
                 "content": forDisplay(self.checkUnderlyingOptions()).reset_index()
 
             },
-            {
-                "title": "SPX IC Trades",
-                "content": forDisplay(self.construct_from_underlying("SPX", 5, 5))
-            },
-            {
-                "title": "SPX 15 Delta Bear Call",
-                "content": forDisplay(self.build_credit_spread("SPX", 0.15, "C"))
-            },
-            {
-                "title": "SPX 15 Delta Bull Put",
-                "content": forDisplay(self.build_credit_spread("SPX", 0.15, "P"))
-            },
-            {
-                "title": "SPX 30/10 Bear Call",
-                "content": forDisplay(self.build_credit_spread_dollar("SPX", 35, 10, "C"))
-            },
-            {
-                "title": "SPX 30/10  Bull Put",
-                "content": forDisplay(self.build_credit_spread_dollar("SPX", 35, 10, "P"))
-            },
-            {
-                "title": "SPX 125$ Bull Put",
-                "content": forDisplay(self.build_credit_spread_by_premium("SPX", 1.25, "P")),
-                "colspan": 2
-            },
-            {
-                "title": "SPX 125$ Bear Call",
-                "content": forDisplay(self.build_credit_spread_by_premium("SPX", 1.25, "C")),
-                "colspan": 2
-            },
-            
+            defineSpreadTile("SPX 15 Delta Bear Call (C)", self.build_credit_spread(symbol, 0.15, "C", wing_span), 2, tp),
+            defineSpreadTile("SPX 15 Delta Bull Put (P)",  self.build_credit_spread(symbol, 0.15, "P", wing_span), 2, tp),
+            defineSpreadTile("SPX "+ str(callDistance) +"/"+ str(wing_span) +" Bear Call (1)", self.build_credit_spread_dollar(symbol, callDistance, wing_span, "C"), 2, tp),
+            defineSpreadTile("SPX "+ str(putDistance) +"/"+ str(wing_span) +"  Bull Put (2)",  self.build_credit_spread_dollar(symbol, putDistance, wing_span, "P"), 2, tp),
+            defineSpreadTile("SPX "+ str(target_premium) +"$ Bear Call (3)", self.build_credit_spread_by_premium(symbol, target_premium, "C", wing_span), 2, tp),
+            defineSpreadTile("SPX "+ str(target_premium) +"$ Bull Put (4)",  self.build_credit_spread_by_premium(symbol, target_premium, "P", wing_span), 2, tp),
+            defineSpreadTile("SPX IC Trades (I)", self.construct_from_underlying(symbol, ic_wingspan, ic_wingspan), 2, tp),
+            defineSpreadTile("Best EV", self.evTrader.find_best_ev_credit_spreads(symbol, 10,0.8),2,tp),
+          
             {
                 "title": "Candle Data",
-                "content": self.candleData.get("SPX", pd.DataFrame()).iloc[::-1],
-                "colspan": 3,
+                "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
+                "colspan": 4,
                 "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
             },
-
             {
-                "title": "Orders",
-                "content": pd.DataFrame(self.orders)
+                "title": "Candle Data VIX",
+                "content": self.candleData.get("VIX", pd.DataFrame()).iloc[::-1],
+                "colspan": 4,
+                "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
             },
             {
                 "title": "Action Log",
                 "content": pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame(),
-                
+                "colspan": 2
             },
-            {
-                "title": "API Orders",
-                "content": pd.DataFrame.from_dict(self.apiOrders, orient='index')
-            },
+
             {
             "title": "Options Data",
             "content": self.options_data #.dropna(subset=['delta'])
             },
             {
                 "title": "SPX Stats",
-                "content": self.get_strategy_statistics(self.candleData.get("SPX", pd.DataFrame()))
+                "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame()))
             },
-            {
-                "title": "SPX Distances",
-                "content": self.get_optimal_offsets(self.candleData.get("SPX", pd.DataFrame())),
-                "colspan": 3
-            }
+
 
             
         ]
     
         """
+                    {
+                "title": "SPX Distances",
+                "content": self.get_optimal_offsets(self.candleData.get(symbol, pd.DataFrame())),
+                "colspan": 2
+            },  
         {
             "title": "SPX RSI",
             "content": tah.calc_rsi_stuff(self.candleData.get("SPX", pd.DataFrame()), "RSI") if "SPX" in self.candleData else pd.DataFrame(),
@@ -474,6 +522,7 @@ class IBApp(IBWrapper, IBClient):
             return pd.Series({'optimal_d': np.nan, 'winrate': 0.0})
 
     def get_optimal_offsets(self, df: pd.DataFrame, desired_winrate=0.8) -> pd.DataFrame:
+        pass
         """
         Berechnet für jeden Signaltyp (und bei SellIronCondor je Leg separat) den optimalen Strike-Offset d
         (sodass mindestens desired_winrate an Trades gewinnen würden, wenn der Optionsstrike auf close+d (bei
@@ -560,147 +609,25 @@ class IBApp(IBWrapper, IBClient):
             self.addToActionLog(f"Error in get_optimal_offsets: {str(e)}")
             return pd.DataFrame()
         
-    def send_iron_condor_order(self, symbol, distance=5, wingspan=5):
-        if (symbol not in self.market_data.index):
-            return 
-        rows = self.construct_from_underlying(symbol, distance, wingspan)
-        self.place_combo_order(rows)
-
-    def send_credit_spread_order(self, symbol, target_delta, type="C", wingspan=10):
-        rows = self.build_credit_spread(symbol, target_delta, type, wingspan)
-        self.place_combo_order(rows, 50, None, "CreditSpread-"+type)
-
-    def create_order(self, action, quantity, orderType, price=None):
-        order = Order()
-        order.action = action
-        order.totalQuantity = quantity
-        order.orderType = orderType
-        if price:
-            order.lmtPrice = price
-        order.transmit = False
-        return order
-
-
-
-
-    def place_combo_order(self, contract_rows, tp=None, sl=None, ref="IronCondor"):
-        try:
-            if(contract_rows is None):
-                return
-            
-            # Access the first key-value pair from the dictionary
-            first_key = next(iter(contract_rows))
-            ref = "Bot-"+ref+"-"+contract_rows[first_key]["Symbol"]
-            # Create Combo Contract
-            combo_contract = Contract()
-            combo_contract.symbol = contract_rows[first_key]["Symbol"]
-            combo_contract.secType = "BAG"
-            combo_contract.currency = "USD"
-            combo_contract.exchange = "SMART"
-            combo_contract.comboLegs = []
-
-            for key, row in contract_rows.items():
-                if "long" in key or "short" in key:
-                    leg = ComboLeg()
-                    leg.conId = row["ConId"]
-                    leg.ratio = 1
-                    leg.action = "BUY" if "long" in key else "SELL"
-                    leg.exchange = "SMART"
-                    combo_contract.comboLegs.append(leg)
-
-            # Calculate the limit price for the LMT order
-            limit_price = 0
-            for key, row in contract_rows.items():
-                if "long" in key:
-                    limit_price += row["ask"]  # Ask price for long legs
-                else:
-                    limit_price -= row["bid"]  # Bid price for short legs
-
-            # Create a Limit Order (parent order)
-            limit_order = self.create_order("BUY", 1, "LMT", limit_price)
-            limit_order.orderRef = ref
-
-            # Place the Combo Order (parent order)
-            parent_order_id = self.nextOrderId()
-
-            # Create a Stop Order (child order)
-            """
-            stop_price = 0
-            for key, row in contract_rows.items():
-                if "short" in key:
-                    stop_price += row["bid"]  # Add bid price for short legs
-                else:
-                    stop_price -= row["ask"]  # Subtract ask price for long legs
-            """
-            def round_to_next_multiple(number, multiple=0.05):
-                """
-                Round the given number to the nearest multiple of 'multiple'.
-                :param number: float, the number to be rounded
-                :param multiple: float, the multiple to round to (default is 0.05)
-                :return: float, the rounded number
-                """
-                return round(number / multiple) * multiple
-
-            if (sl is None):
-                stop_order = self.create_order("SELL", 1, "MKT")
-                stop_order.orderRef = ref
-                stop_order.parentId = parent_order_id  # Link to parent order
-
-                # Add conditions for short legs being in-the-money
-                for key, row in contract_rows.items():
-                    if "long" in key:
-                        continue
-
-                    condition = PriceCondition()
-                    condition.conId = row["UnderConId"]
-                    condition.isConjunctionConnection = False
-                    condition.triggerMethod = 2
-
-                    if (condition.conId == 416904 or condition.conId == 13455763 or condition.conId == 137851301): #SPX, VIX, XSP
-                        condition.exchange = 'CBOE'
-                    else:
-                        condition.exchange = 'SMART'
-
-                    if "short_call" in key:
-                        condition.isMore = True
-                        condition.price = row["Strike"] + 0.5
-                        stop_order.conditions.append(condition)
-                    elif "short_put" in key:
-                        condition.isMore = False
-                        condition.price = row["Strike"] - 0.5
-                        stop_order.conditions.append(condition)
-            else:
-                stop_order = self.create_order("SELL", 1, "STP")
-                stop_order.auxPrice = round_to_next_multiple(limit_price * (sl/100))
-                stop_order.orderRef = ref
-                stop_order.parentId = parent_order_id  # Link to parent order
-
-            tpOrder = None
-            if (tp is not None):
-                tpOrder = self.create_order("SELL", 1, "LMT", round_to_next_multiple(limit_price * (tp/100)))
-                tpOrder.orderRef = ref
-                tpOrder.parentId = parent_order_id  # Link to parent order
-            # Place the Stop Order (child order)
-            # self.placeOrder(self.nextReqId(), combo_contract, stop_order)
-
-            self.orders.append((parent_order_id, combo_contract, limit_order))
-            self.placeOrder(parent_order_id, combo_contract, limit_order)
-
-            if (tpOrder is not None):
-                tpOrderId = self.nextOrderId()
-                self.orders.append((tpOrderId, combo_contract, tpOrder))
-                self.placeOrder(tpOrderId, combo_contract, tpOrder)
-
-
-            stpLossId = self.nextOrderId()
-            stop_order.transmit = True
-            self.orders.append((stpLossId, combo_contract, stop_order))
-            self.placeOrder(stpLossId, combo_contract, stop_order)
-        except Exception as e:
-            self.addToActionLog("Error placing order: " + str(e))
-
     @iswrapper
     def error(self, reqId, errorTime, errorCode, errorString, advancedOrderRejectJson=""):
+        if (errorCode == 300):
+            optionReq = self.option_id_req.get(reqId, None)
+            if (optionReq is not None):
+                del self.option_id_req[optionReq]                
+                return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+            mktReq = self.market_data_req_ids.get(reqId, None)
+            if (mktReq is not None):
+                del self.market_data_req_ids[reqId]
+                return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+        info = self.market_data_req_ids.get(reqId, None)
+        if (info is not None and "date" in info):
+            requestDate = info.get("date", None)
+            symbols = info.get("symbols", None)
+            if requestDate is not None and requestDate == self.lastRequestedDateForContracts:
+                plusOneDay = requestDate + timedelta(days=1)
+                self.fetch_options_data(symbols, plusOneDay)
+
         if errorCode not in [2104, 2106,2158]:
             print("Error. Id: ", reqId, "Time: ", errorTime, " Code: ", errorCode, " Msg: ", errorString)
             self.addToActionLog(" Msg: " + str(errorString) + " Code: " + str(errorCode) + " Id: " + str(reqId))
@@ -771,12 +698,6 @@ class IBApp(IBWrapper, IBClient):
                 return closest_row
 
         return None
-    def send_credit_spread_by_premium(self, symbol, target_premium, type="C", max_wingspan=10):
-        current_underlying_price = self.getPriceForSybol(symbol)
-        if current_underlying_price is None:
-            return
-        rows = self.find_credit_spread_by_premium(symbol, target_premium, current_underlying_price, type, max_wingspan)
-        self.place_combo_order(rows, 50, None, "PremiumCreditSpread-"+type)
 
     def find_credit_spread_by_premium(self, symbol, target_premium, current_underlying_price, type="C", max_wingspan=10):
         """
@@ -810,7 +731,7 @@ class IBApp(IBWrapper, IBClient):
             return None
         
         # get rid of NaN prices and -1 prices
-        df_symbol = df_symbol[(df_symbol["bid"] > 0) & (df_symbol["ask"] > 0)]
+        df_symbol = df_symbol[(df_symbol["bid"] > 0) & (df_symbol["ask"] > 0) & (df_symbol["delta"].abs() < 0.3)]
 
         # Normalize type and define functions/conditions based on option type.
         type = type.upper()
@@ -852,9 +773,9 @@ class IBApp(IBWrapper, IBClient):
 
         # Compute the OTM distance of the short leg
         pairs["otm_distance"] = otm_distance_func(pairs["Strike_short"])
-
+        """
         # Define a tolerance for the premium error
-        tolerance = 0.02 * target_premium  # 2% of target premium
+        tolerance = 0.2 * target_premium  # 2% of target premium
 
         # Select candidates within the tolerance range
         valid_candidates = pairs[pairs["premium_error"] <= tolerance]
@@ -881,7 +802,34 @@ class IBApp(IBWrapper, IBClient):
             current_candidate = new_candidate  # First-time assignment
 
         best_candidate = current_candidate  # The final selection
+        """
 
+        def find_closest_row(df, target_net_credit):
+            # Sort the dataframe by 'otm' in descending order
+            df = df.sort_values(by='otm_distance', ascending=False).reset_index(drop=True)
+            
+            # Calculate the absolute difference from the target
+            df['abs_diff'] = abs(df['net_credit'] - target_net_credit)
+            
+            # Use np.where to find indices where net_credit surpasses the target
+            surpass_indices = np.where(df['net_credit'] >= target_net_credit)[0]
+            
+            if len(surpass_indices) > 0:
+                # Get the first row that surpasses the target
+                surpass_index = surpass_indices[0]
+                current_row = df.iloc[surpass_index]
+                
+                # Compare with the previous row (if it exists)
+                if surpass_index > 0:
+                    previous_row = df.iloc[surpass_index - 1]
+                    if previous_row['abs_diff'] < current_row['abs_diff']:
+                        return previous_row
+                return current_row
+            else:
+                # If no row surpasses the target, return the row with the smallest absolute difference
+                return df.loc[df['abs_diff'].idxmin()]
+            
+        best_candidate = find_closest_row(pairs, target_premium)
 
 
         # Extract the short and wing leg rows (with suffixes removed).
@@ -906,10 +854,16 @@ class IBApp(IBWrapper, IBClient):
         """
 
         # Return the result, with net_credit as a one-element Series named 'bid'.
-        return {
-            short_key: short_leg,
-            long_key: wing_leg
-        }
+        if (type == "P"):
+            return {
+                short_key: short_leg,
+                long_key: wing_leg
+            }
+        else:
+            return {
+                long_key: wing_leg,
+                short_key: short_leg
+            }
 
 
 
@@ -944,7 +898,7 @@ class IBApp(IBWrapper, IBClient):
         if (self.options_data.empty):
             return None
         df_symbol = self.filter_options_data(symbol, type)
-        deltaRow = self.find_closest_strike_row(df_symbol, short_strike + wingspan, "C")
+        deltaRow = self.find_closest_strike_row(df_symbol, short_strike, "C")
         self.request_options_market_data(deltaRow)
         
         if deltaRow is None:
@@ -1104,7 +1058,7 @@ class IBApp(IBWrapper, IBClient):
                 if (row["Symbol"] == symbol and row["Quantity"] != 0):
                     return True
 
-    def reqHistoricalDataFor(self, symbol, type, exchange, catchUp = False):
+    def reqHistoricalDataFor(self, symbol, type, exchange, catchUp = False, lookBackTimeForce = None, candleSizeForce = None):
         contract = Contract()
         contract.symbol = symbol
         contract.secType = type
@@ -1121,6 +1075,12 @@ class IBApp(IBWrapper, IBClient):
             lookBackTime = self.lookBackTime
             if (catchUp):
                 lookBackTime = "600 S"
+            elif (lookBackTimeForce is not None):
+                lookBackTime = lookBackTimeForce
+
+            candleSize = self.candleSize
+            if (candleSizeForce is not None):
+                candleSize = candleSizeForce
 
             reqId = self.nextReqId()
 
@@ -1128,7 +1088,7 @@ class IBApp(IBWrapper, IBClient):
             self.addToActionLog("Requesting historical data for " + symbol + " "+ str(reqId ))
             print("Requesting historical data for " + whatToShow + " " + symbol + " "+ str(reqId ), lookBackTime)
             
-            self.reqHistoricalData(reqId, contract, "", lookBackTime, self.candleSize, whatToShow, 1, 2, upToDate, [])
+            self.reqHistoricalData(reqId, contract, "", lookBackTime, candleSize, whatToShow, 1, 2, upToDate, [])
         
             # self.reqHistoricalData(reqId, contract, "", self.lookBackTime, "5 mins", "TRADES", 1, 1, True, [])
             time.sleep(1)  # To avoid pacing violations
@@ -1151,7 +1111,7 @@ class IBApp(IBWrapper, IBClient):
             symbol = self.market_data_req_ids[reqId]["symbol"]
             prefix = self.market_data_req_ids[reqId]["prefix"]
 
-            print(f"Received historicalData for reqId: {reqId} symbol: {symbol} prefix: {prefix}", end="\r")
+            # print(f"Received historicalData for reqId: {reqId} symbol: {symbol} prefix: {prefix}", end="\r")
             self.initDataFrame(symbol)
             with self.candleLock:
                 # Prepare bar data with the appropriate prefix
@@ -1192,7 +1152,9 @@ class IBApp(IBWrapper, IBClient):
 
     def addIndicators(self, reqId):
         symbol = self.market_data_req_ids[reqId]["symbol"]
+        self.addIndicatorsFor(symbol)
 
+    def addIndicatorsFor(self, symbol):
         with self.candleLock:
             
             if symbol not in self.candleData:
@@ -1201,13 +1163,15 @@ class IBApp(IBWrapper, IBClient):
                 self.candleData[symbol] = tah.addIndicatorsOn(self, self.candleData[symbol], symbol)
                 
 
-    def get_chart_data(self, mergePredictions = False):
-        symbol = "SPX"
+    def get_chart_data(self, mergePredictions = False, symbol = "SPY"):
+        data = None
         with self.candleLock:
             if (symbol not in self.candleData):
-                return pd.DataFrame()
-            self.addToActionLog("Plot chart with data")
-            return self.candleData[symbol]
+                data =  pd.DataFrame()
+            else:   
+                self.addToActionLog("Plot chart with data" + str(symbol))
+                data = self.candleData[symbol].copy()
+        return data
         
     @iswrapper
     def historicalDataEnd(self, reqId, start: str, end: str):
@@ -1274,7 +1238,7 @@ class IBApp(IBWrapper, IBClient):
                 # Generate all possible columns with and without prefixes
                 prefixes = [p[1] for p in self.marketDataPrefix]
                 base_columns = ["date", "open", "close", "high", "low", "volume", "wap", "count"]
-                columns = ["date", "open", "close", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist_p", "p_dist_p", "final_signal", "tech_signal", "high", "low",  "volume", "wap", "count"]
+                columns = ["date", "open", "close", "night_gap", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist_p", "p_dist_p", "final_signal", "tech_signal", "high", "low",  "volume", "wap", "count"]
 
                 for pre in prefixes:
                     for col in base_columns:
@@ -1308,6 +1272,7 @@ class IBApp(IBWrapper, IBClient):
 
     @iswrapper
     def contractDetailsEnd(self, reqId):
+        self.lastContractsDataUpdatedAt = datetime.now()
         contract: Contract = self.contract_details[reqId]
         symbol = contract.symbol
 
@@ -1336,3 +1301,4 @@ class IBApp(IBWrapper, IBClient):
             self.request_options_market_data(row)
 
         return super().contractDetailsEnd(reqId)
+    
