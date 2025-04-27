@@ -136,7 +136,7 @@ class TwsOrderAdapter(EWrapper, EClient):
         return True
 
 
-    def place_combo_order(self, contract_rows, tp=None, sl=None, ref="IronCondor"):
+    def place_combo_order(self, contract_rows, tp=None, sl=None, ref="IronCondor", touchDistance=0.5):
         #start a new thread to place the order
         if (not TwsOrderAdapter.validateSpread(contract_rows)):
             self.addToActionLog("Invalid Spread, abort")
@@ -146,7 +146,7 @@ class TwsOrderAdapter(EWrapper, EClient):
         thread.start()
 
 
-    def place_combo_order_threaded(self, contract_rows, tp=None, sl=None, ref="IronCondor"):
+    def place_combo_order_threaded(self, contract_rows, tp=None, sl=None, ref="IronCondor", touchDistance=0.5, amount=1):
         try:
             if(contract_rows is None):
                 return
@@ -184,7 +184,7 @@ class TwsOrderAdapter(EWrapper, EClient):
             limit_price = TwsOrderAdapter.calcSpreadPrice(contract_rows, 0.05)
 
             # Create a Limit Order (parent order)
-            limit_order = self.create_order("BUY", 1, "LMT", limit_price)
+            limit_order = self.create_order("BUY", amount, "LMT", limit_price)
             limit_order.orderRef = ref
 
             # Place the Combo Order (parent order)
@@ -213,8 +213,8 @@ class TwsOrderAdapter(EWrapper, EClient):
             if (row["Symbol"] == "SPX"):
                 multiple = 0.05
 
-            if (sl is None):
-                stop_order = self.create_order("SELL", 1, "MKT")
+            if (sl is None and touchDistance is not None):
+                stop_order = self.create_order("SELL", amount, "MKT")
                 stop_order.orderRef = ref
                 stop_order.parentId = parent_order_id  # Link to parent order
 
@@ -235,21 +235,21 @@ class TwsOrderAdapter(EWrapper, EClient):
 
                     if "short_call" in key:
                         condition.isMore = True
-                        condition.price = row["Strike"] + 0.5
+                        condition.price = row["Strike"] + touchDistance
                         stop_order.conditions.append(condition)
                     elif "short_put" in key:
                         condition.isMore = False
-                        condition.price = row["Strike"] - 0.5
+                        condition.price = row["Strike"] - touchDistance
                         stop_order.conditions.append(condition)
-            else:
-                stop_order = self.create_order("SELL", 1, "STP")
+            elif (sl is not None):
+                stop_order = self.create_order("SELL", amount, "STP")
                 stop_order.auxPrice = round_to_next_multiple(limit_price * (sl/100), multiple)
                 stop_order.orderRef = ref
                 stop_order.parentId = parent_order_id  # Link to parent order
 
             tpOrder = None
             if (tp is not None):
-                tpOrder = self.create_order("SELL", 1, "LMT", round_to_next_multiple(limit_price * (tp/100), multiple))
+                tpOrder = self.create_order("SELL", amount, "LMT", round_to_next_multiple(limit_price * (tp/100), multiple))
                 tpOrder.orderRef = ref
                 tpOrder.parentId = parent_order_id  # Link to parent order
             # Place the Stop Order (child order)
@@ -370,6 +370,17 @@ class TwsOrderAdapter(EWrapper, EClient):
         for key, row in contract_rows.iterrows():
             if row["ConId"] in self.orderContracts:
                 self.orderContracts[row["ConId"]].update(row.to_dict())
+
+    def has_existing_order_contracts(self, contract_rows: dict):
+        """
+        Check if the order contracts already exist in the DataFrame.
+        :param contract_rows: Dictionary containing contract information.
+        :return: True if existing order contracts are found, False otherwise.
+        """
+        for key, row in contract_rows.items():
+            if row["ConId"] in self.orderContracts:
+                return True
+        return False
 
     def is_room_for_new_positions(self, symbol, opt_type=None):
         dataframe = pd.DataFrame(self.orderContracts.values())

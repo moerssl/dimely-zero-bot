@@ -5,8 +5,9 @@ from scipy.stats import norm
 
 
 class ExpectedValueTrader():
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, logFunc=None):
         self.options_data = df
+        self.logFunc = logFunc if logFunc else lambda x: None
 
     def find_best_ev_credit_spreads(self, symbol: str, max_wingspan: float, tp: float = 0.5,
                               sl: float = 2.0, alpha: float = 0.25,
@@ -15,79 +16,82 @@ class ExpectedValueTrader():
         Finds the iron condor with highest combined EV, enforcing long_put < short_put < short_call < long_call.
         Does not alter DataFrame index; uses ConId for row lookup.
         """
-        df = self.options_data[
-            (self.options_data['Symbol'] == symbol) &
-            (self.options_data['delta'].abs() <= 0.5) &
-            (self.options_data['bid'] > 0) &
-            (self.options_data['ask'] > 0)
-        ]
-        if df.empty:
-            return None
-
-        def _spread_df(side_df, is_call: bool):
-            pairs = side_df.merge(side_df, how='cross', suffixes=('_short','_long'))
-            # proper strike order
-            if is_call:
-                pairs = pairs[pairs['Strike_long'] > pairs['Strike_short']]
-            else:
-                pairs = pairs[pairs['Strike_short'] > pairs['Strike_long']]
-            pairs['wingspan'] = (pairs['Strike_long'] - pairs['Strike_short']).abs()
-            pairs = pairs[pairs['wingspan'] <= max_wingspan]
-            pairs['net_credit'] = pairs['bid_short'] - pairs['ask_long']
-            pairs = pairs[pairs['net_credit'] >= min_credit]
-            if pairs.empty:
-                return None
-            # EV simple_partial
-            d_s = pairs['delta_short'].abs()
-            d_l = pairs['delta_long'].abs()
-            p_win = 1 - d_s
-            p_full = d_l
-            p_part = (d_s - d_l).abs()
-            mp = pairs['net_credit']
-            ml = mp - pairs['wingspan']
-            mid = (mp + ml) / 2
-            pairs['EV'] = p_win * mp + p_full * ml + p_part * mid
-            return pairs[['ConId_short','ConId_long','Strike_short','Strike_long','EV']]
-
-        calls = df[df['Type'] == 'C']
-        puts = df[df['Type'] == 'P']
-        call_spreads = _spread_df(calls, True)
-        put_spreads = _spread_df(puts, False)
-
-        # both sides: best iron condor
-        if call_spreads is not None and put_spreads is not None:
-            combos = call_spreads.merge(put_spreads, how='cross', suffixes=('_call','_put'))
-            valid = combos[
-                (combos['Strike_long_put'] < combos['Strike_short_put']) &
-                (combos['Strike_short_put'] < combos['Strike_short_call']) &
-                (combos['Strike_short_call'] < combos['Strike_long_call'])
+        try:
+            df = self.options_data[
+                (self.options_data['Symbol'] == symbol) &
+                (self.options_data['delta'].abs() <= 0.5) &
+                (self.options_data['bid'] > 0) &
+                (self.options_data['ask'] > 0)
             ]
-            if valid.empty:
+            if df.empty:
                 return None
-            valid = valid.copy()
-            valid['EV_total'] = valid['EV_call'] + valid['EV_put']
-            best = valid.loc[valid['EV_total'].idxmax()]
 
-            # lookup rows by ConId using boolean indexing and iloc
-            lc = self.options_data[self.options_data['ConId'] == best['ConId_long_call']].iloc[0]
-            sc = self.options_data[self.options_data['ConId'] == best['ConId_short_call']].iloc[0]
-            sp = self.options_data[self.options_data['ConId'] == best['ConId_short_put']].iloc[0]
-            lp = self.options_data[self.options_data['ConId'] == best['ConId_long_put']].iloc[0]
-            return {'long_call': lc, 'short_call': sc,
-                    'short_put': sp, 'long_put': lp}
+            def _spread_df(side_df, is_call: bool):
+                pairs = side_df.merge(side_df, how='cross', suffixes=('_short','_long'))
+                # proper strike order
+                if is_call:
+                    pairs = pairs[pairs['Strike_long'] > pairs['Strike_short']]
+                else:
+                    pairs = pairs[pairs['Strike_short'] > pairs['Strike_long']]
+                pairs['wingspan'] = (pairs['Strike_long'] - pairs['Strike_short']).abs()
+                pairs = pairs[pairs['wingspan'] <= max_wingspan]
+                pairs['net_credit'] = pairs['bid_short'] - pairs['ask_long']
+                pairs = pairs[pairs['net_credit'] >= min_credit]
+                if pairs.empty:
+                    return None
+                # EV simple_partial
+                d_s = pairs['delta_short'].abs()
+                d_l = pairs['delta_long'].abs()
+                p_win = 1 - d_s
+                p_full = d_l
+                p_part = (d_s - d_l).abs()
+                mp = pairs['net_credit']
+                ml = mp - pairs['wingspan']
+                mid = (mp + ml) / 2
+                pairs['EV'] = p_win * mp + p_full * ml + p_part * mid
+                return pairs[['ConId_short','ConId_long','Strike_short','Strike_long','EV']]
 
-        # fallback: best single side
-        out = {}
-        if call_spreads is not None:
-            best_c = call_spreads.loc[call_spreads['EV'].idxmax()]
-            out['long_call'] = self.options_data[self.options_data['ConId'] == best_c['ConId_long']].iloc[0]
-            out['short_call'] = self.options_data[self.options_data['ConId'] == best_c['ConId_short']].iloc[0]
-        if put_spreads is not None:
-            best_p = put_spreads.loc[put_spreads['EV'].idxmax()]
-            out['short_put'] = self.options_data[self.options_data['ConId'] == best_p['ConId_short']].iloc[0]
-            out['long_put'] = self.options_data[self.options_data['ConId'] == best_p['ConId_long']].iloc[0]
-        return out or None
+            calls = df[df['Type'] == 'C']
+            puts = df[df['Type'] == 'P']
+            call_spreads = _spread_df(calls, True)
+            put_spreads = _spread_df(puts, False)
 
+            # both sides: best iron condor
+            if call_spreads is not None and put_spreads is not None:
+                combos = call_spreads.merge(put_spreads, how='cross', suffixes=('_call','_put'))
+                valid = combos[
+                    (combos['Strike_long_put'] < combos['Strike_short_put']) &
+                    (combos['Strike_short_put'] < combos['Strike_short_call']) &
+                    (combos['Strike_short_call'] < combos['Strike_long_call'])
+                ]
+                if valid.empty:
+                    return None
+                valid = valid.copy()
+                valid['EV_total'] = valid['EV_call'] + valid['EV_put']
+                best = valid.loc[valid['EV_total'].idxmax()]
+
+                # lookup rows by ConId using boolean indexing and iloc
+                lc = self.options_data[self.options_data['ConId'] == best['ConId_long_call']].iloc[0]
+                sc = self.options_data[self.options_data['ConId'] == best['ConId_short_call']].iloc[0]
+                sp = self.options_data[self.options_data['ConId'] == best['ConId_short_put']].iloc[0]
+                lp = self.options_data[self.options_data['ConId'] == best['ConId_long_put']].iloc[0]
+                return {'long_call': lc, 'short_call': sc,
+                        'short_put': sp, 'long_put': lp}
+
+            # fallback: best single side
+            out = {}
+            if call_spreads is not None:
+                best_c = call_spreads.loc[call_spreads['EV'].idxmax()]
+                out['long_call'] = self.options_data[self.options_data['ConId'] == best_c['ConId_long']].iloc[0]
+                out['short_call'] = self.options_data[self.options_data['ConId'] == best_c['ConId_short']].iloc[0]
+            if put_spreads is not None:
+                best_p = put_spreads.loc[put_spreads['EV'].idxmax()]
+                out['short_put'] = self.options_data[self.options_data['ConId'] == best_p['ConId_short']].iloc[0]
+                out['long_put'] = self.options_data[self.options_data['ConId'] == best_p['ConId_long']].iloc[0]
+            return out or None
+        except Exception as e:
+            self.logFunc(f"Error in find_best_ev_credit_spreads: {e}")
+            return None
 
     def find_best_ev_credit_spreads_old(self, symbol, max_wingspan, tp=1.0, alpha=0.25, minTypeCredit = 0.2):
         try:

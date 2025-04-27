@@ -32,7 +32,6 @@ class IBWrapper(EWrapper):
 
 
         self.contract_details = {}
-        self.evTrader = ExpectedValueTrader(self.options_data)
 
     @iswrapper
     def position(self, account: str, contract: Contract, position: float, avgCost: float):
@@ -150,20 +149,20 @@ class IBWrapper(EWrapper):
         missing_columns = [col for col in required_columns if col not in self.options_data.columns]
         if missing_columns:
             return
-
-        # Update 'bid' and 'ask' without loops:
-        # For each row, if bid (or ask) is >= 0, keep it; 
-        # otherwise, if last is >= 0, use last; else, use close.
-        self.options_data['bid'] = np.where(
-            (self.options_data['bid'] >= 0),
-            self.options_data['bid'],
-            np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
-        )
-        self.options_data['ask'] = np.where(
-            (self.options_data['ask'] >= 0),
-            self.options_data['ask'],
-            np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
-        )
+        with self.optionsDataLock:
+            # Update 'bid' and 'ask' without loops:
+            # For each row, if bid (or ask) is >= 0, keep it; 
+            # otherwise, if last is >= 0, use last; else, use close.
+            self.options_data['bid'] = np.where(
+                (self.options_data['bid'] >= 0),
+                self.options_data['bid'],
+                np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
+            )
+            self.options_data['ask'] = np.where(
+                (self.options_data['ask'] >= 0),
+                self.options_data['ask'],
+                np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
+            )
         
     @iswrapper
     def contractDetails(self, reqId: int, contractDetails: ContractDetails):

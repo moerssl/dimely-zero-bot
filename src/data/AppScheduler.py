@@ -15,11 +15,12 @@ import logging
 logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 
 class AppScheduler:
-    def __init__(self, app: IBApp, orderApp: TwsOrderAdapter, symbol = "SPY"):
+    def __init__(self, app: IBApp, orderApp: TwsOrderAdapter, symbol = "SPY", secondSymbol = "QQQ"):    
         self.app = app
         self.orderApp = orderApp
         self.scheduler = BackgroundScheduler()
         self.symbol = symbol
+        self.secondarySymbol = secondSymbol
 
         # Define New York timezone for the triggers.
         self.ny_tz = pytz.timezone("America/New_York")
@@ -46,6 +47,9 @@ class AppScheduler:
         delta_last_run = inTzTime(15,0)
         delta_trade_trigger = CronTrigger(minute="*", hour="9-15", timezone=self.ny_tz, start_date=delta_first_run, end_date=delta_last_run)
         self.scheduler.add_job(func=self.checkDeltaTrade, trigger=delta_trade_trigger, id="checkDeltaTrade")
+        
+        catch_up_trigger = CronTrigger(second=30, minute="*", hour="9-16", timezone=self.ny_tz, start_date=delta_first_run)
+        self.scheduler.add_job(func=self.catch_up, trigger=catch_up_trigger, id="catch_up")
 
         # Schedule checkMultiEntryIconCondor every 30 minutes between 12:00 and 15:00 New York time.
         multi_first_run = inTzTime(12,0)
@@ -56,17 +60,41 @@ class AppScheduler:
         lateIcTrigger = CronTrigger(hour=15, minute=55, timezone=self.ny_tz)
         self.scheduler.add_job(self.checkLateIronCondor, trigger=lateIcTrigger, id="checkLateIronCondor")
 
+        secondaryTrigger = CronTrigger(hour=15, minute=0, day_of_week='tue,wed,thu,fri', timezone=self.ny_tz)
+        self.scheduler.add_job(self.checkSecondaryDeltaTrade, trigger=secondaryTrigger, id="checkSecondaryDeltaTrade")
 
         # Start the scheduler.
         self.scheduler.start()
 
+    def catch_up(self):
+        self.app.addToActionLog("CATCHING UP")
+        self.orderApp.reqAutoOpenOrders()
+        sleep(0.5)
+        self.orderApp.reqAllOpenOrders()
+        sleep(0.5)
+
+
     def checkLateIronCondor(self):
-        self.app.addToActionLog("Check Late IC")
-        if self.orderApp.is_room_for_new_positions(self.symbol) and self.hasWarmedUp(): 
-            self.app.addToActionLog("Ordering SPX Iron Condor")
-            legs = self.app.construct_from_underlying(self.symbol, self.ic_wingspan, self.ic_wingspan)
+        self.app.addToActionLog("Check Late IC "+ self.symbol)
+        legs = self.app.construct_from_underlying(self.symbol, self.ic_wingspan, self.ic_wingspan)
+
+        if self.hasWarmedUp() and not self.orderApp.has_existing_order_contracts(legs): 
+            self.app.addToActionLog("Ordering 2155 Iron Condor")
             self.orderApp.place_combo_order(legs, None, None, "IronCondor_2155")
-        
+            sleep(0.5)
+
+        callLegs = self.app.build_credit_spread(self.secondarySymbol, 0.4, "C", 1)
+        putLegs = self.app.build_credit_spread(self.secondarySymbol, 0.4, "P", 1)
+
+        hasCallLegs = self.orderApp.has_existing_order_contracts(callLegs)
+        hasPutLegs = self.orderApp.has_existing_order_contracts(putLegs)
+
+        if not hasCallLegs and not hasPutLegs:
+            self.app.addToActionLog("Ordering 2155 Iron Condor "+ self.secondarySymbol)
+            self.orderApp.place_combo_order(callLegs, None, 200, "IronCondor_C_2155")
+            sleep(0.5)
+            self.orderApp.place_combo_order(putLegs, None, 200, "IronCondor_P_2155")
+               
 
     def checkMultiEntryIconCondor(self):
         self.app.addToActionLog("CHECKING MEIC")
@@ -93,4 +121,9 @@ class AppScheduler:
                 self.orderApp.place_combo_order(putLegs, self.tp_percentage, None, "SchedPutCredit")
                 sleep(0.5)
 
-    
+    def checkSecondaryDeltaTrade(self):
+        if self.orderApp.is_room_for_new_positions(self.secondarySymbol) and self.hasWarmedUp(): 
+            vixPrice = self.app.getPriceForSybol("VIX")
+            self.app.addToActionLog("Ordering 2100 Iron Condor")
+            legs = self.app.construct_from_underlying(self.secondarySymbol, 0.5, 5)
+            self.orderApp.place_combo_order(legs, None, None, "IronCondor_2100", 1.5)

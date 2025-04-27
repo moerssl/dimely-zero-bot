@@ -81,6 +81,8 @@ class IBApp(IBWrapper, IBClient):
         ]
 
         self.lastContractsDataUpdatedAt = None
+        self.evTrader = ExpectedValueTrader(self.options_data, self.addToActionLog)
+
 
         """
         self.loadCandle()
@@ -279,7 +281,7 @@ class IBApp(IBWrapper, IBClient):
         row = self.market_data.loc[symbol]
         return row["Price"]
 
-    def construct_from_underlying(self, symbol, distance=5, wingspan=5):
+    def construct_from_underlying(self, symbol, distance=5.0, wingspan=5.0):
         current_price = self.getPriceForSybol(symbol)   
         if current_price is None:
             return
@@ -354,11 +356,6 @@ class IBApp(IBWrapper, IBClient):
                 "title": "Positions",
                 "content": self.positions
             },
-            {
-                "title": "Free To Trade?",
-                "content": forDisplay(self.checkUnderlyingOptions()).reset_index()
-
-            },
             defineSpreadTile("SPX 15 Delta Bear Call (C)", self.build_credit_spread(symbol, 0.15, "C", wing_span), 2, tp),
             defineSpreadTile("SPX 15 Delta Bull Put (P)",  self.build_credit_spread(symbol, 0.15, "P", wing_span), 2, tp),
             defineSpreadTile("SPX "+ str(callDistance) +"/"+ str(wing_span) +" Bear Call (1)", self.build_credit_spread_dollar(symbol, callDistance, wing_span, "C"), 2, tp),
@@ -366,6 +363,8 @@ class IBApp(IBWrapper, IBClient):
             defineSpreadTile("SPX "+ str(target_premium) +"$ Bear Call (3)", self.build_credit_spread_by_premium(symbol, target_premium, "C", wing_span), 2, tp),
             defineSpreadTile("SPX "+ str(target_premium) +"$ Bull Put (4)",  self.build_credit_spread_by_premium(symbol, target_premium, "P", wing_span), 2, tp),
             defineSpreadTile("SPX IC Trades (I)", self.construct_from_underlying(symbol, ic_wingspan, ic_wingspan), 2, tp),
+            
+            defineSpreadTile("QQQ IC 3pm", self.construct_from_underlying("QQQ", 0.5, 5),2),
             defineSpreadTile("Best EV", self.evTrader.find_best_ev_credit_spreads(symbol, 10,0.8),2,tp),
           
             {
@@ -382,14 +381,11 @@ class IBApp(IBWrapper, IBClient):
             },
             {
                 "title": "Action Log",
-                "content": pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame(),
+                "content": forDisplay(pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame()),
                 "colspan": 2
             },
 
-            {
-            "title": "Options Data",
-            "content": self.options_data #.dropna(subset=['delta'])
-            },
+            
             {
                 "title": "SPX Stats",
                 "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame()))

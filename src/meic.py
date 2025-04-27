@@ -24,6 +24,7 @@ async def main():
     orderApp.actionLog = app.actionLog
     focusSymbol = ("SPY", "STK", "SMART")
     secondarySymbol = ("SPX", "IND", "CBOE")
+    thirdSymbol = ("QQQ", "STK", "SMART")
     vix = ("VIX", "IND", "CBOE")
 
     historyCandles = {}
@@ -64,8 +65,8 @@ async def main():
     app.fetch_positions()
     app.reqAllOpenOrders()
     
-    symbols = [focusSymbol,secondarySymbol,vix]
-    optionSymbols = [focusSymbol]
+    symbols = [focusSymbol,vix,thirdSymbol]
+    optionSymbols = [focusSymbol,thirdSymbol]
     app.request_market_data(symbols)
     app.fetch_options_data(optionSymbols)
     historyApp.reqHistoricalDataFor(*vix, False, "2 D", "1 day")
