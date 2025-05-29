@@ -2,6 +2,7 @@ import os
 from typing import List, Tuple
 import numpy as np
 from ib.IBWrapper import IBWrapper
+from ib.IbQueueWrapper import IbQueueWrapper
 from ib.IBClient import IBClient
 from ibapi.contract import Contract
 from ibapi.order import Order
@@ -31,9 +32,11 @@ from util.config import CONFIG
 from ib.TwsOrderAdapter import TwsOrderAdapter
 from data.ExpectedValueTrader import ExpectedValueTrader
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from datetime import timezone as dttimezone
 from pytz import timezone
 import math
+import traceback
 
 logger = getLogger(__name__)
 # logger.setLevel("INFO")
@@ -82,7 +85,8 @@ class IBApp(IBWrapper, IBClient):
 
         self.lastContractsDataUpdatedAt = None
         self.evTrader = ExpectedValueTrader(self.options_data, self.addToActionLog)
-
+        self.additionalTilesFuncs = []
+        self.underlyingSymbols = None
 
         """
         self.loadCandle()
@@ -146,7 +150,16 @@ class IBApp(IBWrapper, IBClient):
     def fetch_positions(self):
         self.reqPositions()
 
-    def request_market_data(self, symbols):
+    def request_market_data(self, undSymbols=None):
+        if undSymbols is not None:
+            self.underlyingSymbols = undSymbols
+        
+        if self.underlyingSymbols is not None:
+            symbols = self.underlyingSymbols
+        else:
+            return
+
+
         for i, symbol_type in enumerate(symbols):
             symbol, type, ex = symbol_type
             contract = Contract()
@@ -161,22 +174,49 @@ class IBApp(IBWrapper, IBClient):
             self.reqMktData(req, contract, "", False, False, [])
             time.sleep(0.1)  # To avoid pacing violations
 
-    def cancel_options_market_data(self,options_data):
-        if (options_data["Id"] not in self.option_id_req):
-            return
-        
-        req = self.option_id_req[options_data["Id"]]
-        req = self.option_id_req.get(options_data["Id"], None)
 
-        if req is None or req in self.market_data_req_ids:
-            return
-        
-        self.cancelMktData(req)
-        del self.market_data_req_ids[req]
+    def cancel_all_options_market_data(self):
+        try:
+            keys = [*self.market_data_req_ids.keys()]
+            for req in keys:
+                self.cancelMktData(req)
+                if req in self.option_id_req.values():
+                    del self.market_data_req_ids[req]
+            self.option_id_req.clear()
+        except Exception as e:
+            self.addToActionLog("Error canceling all market data: " + str(e))
+
+    def cancel_options_market_data(self,options_data):
+        try:
+            id = options_data.get("Id", None)
+            if id is None:
+                id = options_data.get("ConId", None)
+            if (id not in self.option_id_req):
+                return
+            
+            
+            req = self.option_id_req.get(id, None)
+
+            if req is None or req not in self.market_data_req_ids:
+                return
+            
+            self.cancelMktData(req)
+            del self.market_data_req_ids[req]
+        except Exception as e:
+            self.addToActionLog("Error canceling market data: " + str(e))
+
     
     def request_options_market_data(self,options_data):
         if (options_data is None):
             return
+        
+        utcnow = datetime.now(dttimezone.utc)
+        time_value = options_data.get("time")
+        if isinstance(time_value, datetime):
+            if (utcnow - time_value).total_seconds() > 60:
+                self.cancel_options_market_data(options_data)
+                time.sleep(0.1)  # To avoid pacing violations
+
         if (options_data["ConId"] in self.option_id_req):
             # print("options ID already subscribed data available", options_data["ConId"])
             #print(options_data)
@@ -347,53 +387,69 @@ class IBApp(IBWrapper, IBClient):
 
         tp = tp / 100 
         sl = sl / 100
-        return [
-            {
-                "title": "Market Data",
-                "content": self.market_data
-            },
-            {
-                "title": "Positions",
-                "content": self.positions
-            },
-            defineSpreadTile("SPX 15 Delta Bear Call (C)", self.build_credit_spread(symbol, 0.15, "C", wing_span), 2, tp),
-            defineSpreadTile("SPX 15 Delta Bull Put (P)",  self.build_credit_spread(symbol, 0.15, "P", wing_span), 2, tp),
-            defineSpreadTile("SPX "+ str(callDistance) +"/"+ str(wing_span) +" Bear Call (1)", self.build_credit_spread_dollar(symbol, callDistance, wing_span, "C"), 2, tp),
-            defineSpreadTile("SPX "+ str(putDistance) +"/"+ str(wing_span) +"  Bull Put (2)",  self.build_credit_spread_dollar(symbol, putDistance, wing_span, "P"), 2, tp),
-            defineSpreadTile("SPX "+ str(target_premium) +"$ Bear Call (3)", self.build_credit_spread_by_premium(symbol, target_premium, "C", wing_span), 2, tp),
-            defineSpreadTile("SPX "+ str(target_premium) +"$ Bull Put (4)",  self.build_credit_spread_by_premium(symbol, target_premium, "P", wing_span), 2, tp),
-            defineSpreadTile("SPX IC Trades (I)", self.construct_from_underlying(symbol, ic_wingspan, ic_wingspan), 2, tp),
+        try:
+            return [
+                {
+                    "title": "Market Data",
+                    "content": self.market_data
+                },
+                {
+                    "title": "Positions",
+                    "content": self.positions
+                },
+                {
+                    "title": "Current Candle", 
+                    "content": self.checkUnderlyingOptions()
+                },
+                {
+                    "title": "Action Log",
+                    "content": forDisplay(pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame()),
+                    "colspan": 1
+                },
+                defineSpreadTile("SPX 15 Delta Bear Call (C)", self.build_credit_spread(symbol, 0.16, "C", wing_span, 0.2), 2, tp),
+                defineSpreadTile("SPX 15 Delta Bull Put (P)",  self.build_credit_spread(symbol, 0.16, "P", wing_span, 0.2), 2, tp),
+                defineSpreadTile("SPX "+ str(target_premium) +"$ Bear Call (3)", self.build_credit_spread_by_premium(symbol, target_premium, "C", wing_span * 2), 2, tp),
+                defineSpreadTile("SPX "+ str(target_premium) +"$ Bull Put (4)",  self.build_credit_spread_by_premium(symbol, target_premium, "P", wing_span * 2), 2, tp),
+                #defineSpreadTile("SPX IC Trades (I)", self.construct_from_underlying(symbol, ic_wingspan, ic_wingspan), 2, tp),
+                
+                #defineSpreadTile("QQQ IC 3pm", self.construct_from_underlying("QQQ", 0.5, 5),2),
             
-            defineSpreadTile("QQQ IC 3pm", self.construct_from_underlying("QQQ", 0.5, 5),2),
-            defineSpreadTile("Best EV", self.evTrader.find_best_ev_credit_spreads(symbol, 10,0.8),2,tp),
-          
-            {
-                "title": "Candle Data",
-                "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
-                "colspan": 4,
-                "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
-            },
-            {
-                "title": "Candle Data VIX",
-                "content": self.candleData.get("VIX", pd.DataFrame()).iloc[::-1],
-                "colspan": 4,
-                "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
-            },
-            {
-                "title": "Action Log",
-                "content": forDisplay(pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame()),
-                "colspan": 2
-            },
+                defineSpreadTile("SPX "+ str(callDistance) +"/"+ str(wing_span) +" Bear Call (1)", self.build_credit_spread_dollar(symbol, callDistance, wing_span, "C"), 2, tp),
+                defineSpreadTile("SPX "+ str(putDistance) +"/"+ str(wing_span) +"  Bull Put (2)",  self.build_credit_spread_dollar(symbol, putDistance, wing_span, "P"), 2, tp),
+                defineSpreadTile("Best EV", self.evTrader.find_best_ev_credit_spreads(symbol, 10,0.8),2,tp),
+                {
+                    "title": "SPX Stats",
+                    "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame())),
+                    "colspan": 2
+                },
+                {
+                    "title": "Candle Data",
+                    "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
+                    "colspan": 4,
+                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
+                },
+                {
+                    "title": "Candle Data VIX",
+                    "content": self.candleData.get("VIX", pd.DataFrame()).iloc[::-1],
+                    "colspan": 4,
+                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
+                },
 
-            
-            {
-                "title": "SPX Stats",
-                "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame()))
-            },
+                
+                *self.getAdditionalTiles(),
 
-
-            
-        ]
+                
+            ]
+        except Exception as e:
+            stack_trace = traceback.format_exc()
+            self.addToActionLog("Error in getTilesData: " + str(e))
+            self.addToActionLog(stack_trace)
+            return [
+                {
+                    "title": "Error",
+                    "content": str(e) + str(stack_trace),
+                }
+            ]
     
         """
                     {
@@ -413,6 +469,30 @@ class IBApp(IBWrapper, IBClient):
             "content": self.options_data.dropna(subset=['delta'])
         },
         """
+    def getAdditionalTiles(self):
+        """
+        Returns additional tiles for the dashboard. This method can be overridden to provide custom tiles.
+        """
+        tiles = []
+        for func in self.additionalTilesFuncs:
+            try:
+              if callable(func):  # If it's a single function
+                result = func()
+                tiles.append({
+                    "title": func.__name__,
+                    "content": result,
+                })
+              elif isinstance(func, dict):  # If it's a dictionary with predefined attributes
+                result = func.get("function")()
+                tiles.append({
+                    "title": func.get("title", "Untitled"),
+                    "content": result,
+                    "colspan": func.get("colspan", 1),  # Default colspan to 1 if not provided
+                })
+            except Exception as e:
+                self.addToActionLog(f"Error in additional tile function: {str(e)}")
+        return tiles
+    
     def get_strategy_statistics(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Computes statistics for each strategy signal including wins, losses, and winrate.
@@ -436,6 +516,9 @@ class IBApp(IBWrapper, IBClient):
                 return
             # Initialize a new column 'win' with a default value of False.
             df['win'] = False
+
+            # ignore the hold signal
+            df = df[df['final_signal'] != StrategyEnum.Hold]
             
             # Create boolean masks for each strategy using the enum values.
             mask_sell_call = df['final_signal'] == StrategyEnum.SellCall
@@ -643,7 +726,7 @@ class IBApp(IBWrapper, IBClient):
             df_symbol = self.options_data.loc[aligned_mask, :]
             return df_symbol
 
-    def get_closest_delta_row(self, symbol, target_delta, type="C"):
+    def get_closest_delta_row(self, symbol, target_delta, type="C", nth_closest=1):
         df_symbol = self.filter_options_data(symbol, type)
         # Ensure delta column exists, set default if not
         #df_symbol['delta_diff'] = np.abs(df_symbol.get('delta', pd.Series(0)).abs() - target_delta)
@@ -652,15 +735,26 @@ class IBApp(IBWrapper, IBClient):
         """
 
         df_symbol.loc[:, 'delta_diff'] = np.where(
-            df_symbol['delta'].notna(),
-            np.abs(df_symbol['delta'].abs() - target_delta),
+            (df_symbol['delta'].notna()) & ((df_symbol['delta'] > 0) | (df_symbol['delta'] < 0)),
+            np.abs(df_symbol['delta'].fillna(0).abs() - target_delta),
             np.nan
         )
 
 
         # Check if delta_diff exists and find the closest row
         if 'delta_diff' in df_symbol.columns and not df_symbol['delta_diff'].isnull().all():
-            return df_symbol.loc[df_symbol['delta_diff'].idxmin()]
+
+             
+            # Sort by delta_diff to prioritize closest rows
+            df_symbol = df_symbol.sort_values(by='delta_diff', ascending=True)
+
+            # Check if nth_closest is within bounds
+            if nth_closest <= 0 or nth_closest > len(df_symbol):
+                nth_closest = 1
+
+
+            # Return the nth closest row using iloc
+            return df_symbol.iloc[nth_closest - 1]
         else:
             return None
     
@@ -727,7 +821,7 @@ class IBApp(IBWrapper, IBClient):
             return None
         
         # get rid of NaN prices and -1 prices
-        df_symbol = df_symbol[(df_symbol["bid"] > 0) & (df_symbol["ask"] > 0) & (df_symbol["delta"].abs() < 0.3)]
+        df_symbol = df_symbol[(df_symbol["bid"] > 0) & (df_symbol["ask"] > 0) & (df_symbol["delta"] < 0.4) & (df_symbol["delta"] > -0.4)]
 
         # Normalize type and define functions/conditions based on option type.
         type = type.upper()
@@ -825,7 +919,13 @@ class IBApp(IBWrapper, IBClient):
                 # If no row surpasses the target, return the row with the smallest absolute difference
                 return df.loc[df['abs_diff'].idxmin()]
             
-        best_candidate = find_closest_row(pairs, target_premium)
+        pairs["premium_error"] = (pairs["net_credit"] - target_premium).abs()
+        pairs["otm_distance"] = otm_distance_func(pairs["Strike_short"])
+
+        pairs_sorted = pairs.sort_values(by=["premium_error", "otm_distance"], ascending=[True, False])
+        if pairs_sorted.empty:
+            return None
+        best_candidate = pairs_sorted.iloc[0]
 
 
         # Extract the short and wing leg rows (with suffixes removed).
@@ -920,33 +1020,43 @@ class IBApp(IBWrapper, IBClient):
                 "long_put": wingrow
             }
     
-    def build_credit_spread(self, symbol, target_delta, type="C", wingspan=10):
-        if (self.options_data.empty):
+    def build_credit_spread(self, symbol, target_delta, type="C", wingspan=10, minPrice=None):
+        if self.options_data.empty:
             return None
+
         df_symbol = self.filter_options_data(symbol, type)
-        deltaRow = self.get_closest_delta_row(symbol, target_delta, type)
-        if deltaRow is None:
+        delta_row = self.get_closest_delta_row(symbol, target_delta, type)
+        self.request_options_market_data(delta_row)
+
+        if delta_row is None:
             return None
 
-        strike = deltaRow['Strike']
+        def get_wing_row_and_price(delta_row):
+            strike = delta_row['Strike']
+            offset = wingspan if type == "C" else -wingspan
+            wing_row = self.find_closest_strike_row(df_symbol, strike + offset, type)
+            self.request_options_market_data(wing_row)
+            price = delta_row["bid"] - wing_row["ask"]
+            return wing_row, price
 
-        wingrow = None
+        wing_row, price = get_wing_row_and_price(delta_row)
+
+        if minPrice is not None and price < minPrice:
+            delta_row = self.get_closest_delta_row(symbol, target_delta, type, 2)
+            self.request_options_market_data(delta_row)
+            if delta_row is None:
+                return None
+            wing_row, price = get_wing_row_and_price(delta_row)
+            if price < minPrice:
+                return None
+
         if type == "C":
-            wingrow = self.find_closest_strike_row(df_symbol, strike + wingspan, "C")
-            self.request_options_market_data(wingrow)
-
-            return {
-                "long_call": wingrow,
-                "short_call": deltaRow
-            }
+            return {"short_call": delta_row, "long_call": wing_row}
         elif type == "P":
-            wingrow = self.find_closest_strike_row(df_symbol, strike - wingspan, "P")
-            self.request_options_market_data(wingrow)
+            return {"short_put": delta_row, "long_put": wing_row}
 
-            return {
-                "short_put": deltaRow,
-                "long_put": wingrow
-            }
+        return None
+
     
     def subscribe_to_target_delta(self, symbol, target_delta, type="C"):
         closest_row = self.get_closest_delta_row(symbol, target_delta, type)
@@ -1080,7 +1190,7 @@ class IBApp(IBWrapper, IBClient):
 
             reqId = self.nextReqId()
 
-            self.market_data_req_ids[reqId] = { "symbol": symbol, "prefix": prefix }
+            self.market_data_req_ids[reqId] = { "symbol": symbol, "prefix": prefix, "candleSize": candleSize }
             self.addToActionLog("Requesting historical data for " + symbol + " "+ str(reqId ))
             print("Requesting historical data for " + whatToShow + " " + symbol + " "+ str(reqId ), lookBackTime)
             
@@ -1142,6 +1252,11 @@ class IBApp(IBWrapper, IBClient):
                 else:
                     # Add the new data to the DataFrame
                     self.candleData[symbol] = pd.concat([self.candleData[symbol], bar_data_df], ignore_index=True)
+                    #self.candleData[symbol]['date'] = pd.to_datetime(self.candleData[symbol]['date'], errors='coerce')
+                    self.candleData[symbol]['date'] = pd.to_datetime(self.candleData[symbol]['date'])
+
+                    
+
         except Exception as e:
             self.accountDownloadEnd("Error in historicalData: " + str(e))
 
@@ -1191,28 +1306,37 @@ class IBApp(IBWrapper, IBClient):
         return super().historicalDataUpdate(reqId, bar)
 
 
-    def checkUnderlyingOptions(self):
-        symbol = "SPX"
+    def checkUnderlyingOptions(self, symbol="SPY"):
         signal = None
+
         date = None
         put = None
         call = None
+        row = None
+        sentiment = None
+        prevSentiment = None
         with self.candleLock:
-            if ("SPX" in self.candleData):
+            if (symbol in self.candleData):
                 df: pd.DataFrame = self.candleData[symbol]
                 if (len(df) > 1 and "final_signal" in df.columns):
-                    row = df.iloc[-1]
+                    row = df.loc[df["date"].idxmax()] 
+                    rowBeforeRow = df.loc[df["date"].idxmax() - 1] if len(df) > 1 else None
+
+
                     signal = row["final_signal"]
                     date = row["date"]
                     put = row["put_strike"]
                     call = row["call_strike"]
+                    sentiment = row["sentiment"]
+                    prevSentiment = rowBeforeRow["sentiment"] if rowBeforeRow is not None else None
             return {
-                "hasSpxCall": self.hasOrdersOrPositions(symbol, "C"),
-                "hasSpxPut": self.hasOrdersOrPositions(symbol, "P"),
-                "signal": signal,
                 "date": date,
+                "signal": signal,
+                "sentiment": sentiment,
+                "prevSentiment": prevSentiment,
                 "call": call,
-                "put": put
+                "put": put,
+                "row": row,
 
             }
         
@@ -1234,7 +1358,7 @@ class IBApp(IBWrapper, IBClient):
                 # Generate all possible columns with and without prefixes
                 prefixes = [p[1] for p in self.marketDataPrefix]
                 base_columns = ["date", "open", "close", "high", "low", "volume", "wap", "count"]
-                columns = ["date", "open", "close", "night_gap", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist_p", "p_dist_p", "final_signal", "tech_signal", "high", "low",  "volume", "wap", "count"]
+                columns = ["date", "open", "close", "night_gap", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist", "p_dist", "final_signal", "tech_signal", "high", "low", "sentiment", "volume", "wap", "count"]
 
                 for pre in prefixes:
                     for col in base_columns:

@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../tws-python-import"
+		},
+		{
+			"path": "../../../../TWS API/samples/Python/Testbed"
+		},
+		{
+			"path": "../nuxt-tws-dashboard"
+		}
+	],
+	"settings": {}
+}

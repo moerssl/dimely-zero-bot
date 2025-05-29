@@ -34,8 +34,8 @@ CONFIG = {
     "default_target_premium": 1,
     "offsets": {
         "SPY": {
-            "call": 7,
-            "put": 7,
+            "call": 5,
+            "put": 5,
             "wing_span": 5,
             "late_ic_windspan": 2,
             "target_premium": 0.8,

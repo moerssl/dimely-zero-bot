@@ -15,12 +15,27 @@ from util.Chart import Chart
 # Import the predictor class.
 from data.AppScheduler import AppScheduler
 
+import os
+import sys
+import psutil
+
+PID_FILE = "meic.pid"
+
+def is_already_running():
+    """Check if another instance is running."""
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        if psutil.pid_exists(pid):  # Cross-platform method to check process existence
+            return True
+    return False
+
 async def main():
     # Initialize IBApp and connect.
     app = IBApp()
     historyApp = IBApp(lookBackTime="8 D")
     orderApp = TwsOrderAdapter()
-    scheduler = AppScheduler(app, orderApp)
+    scheduler = AppScheduler(app, orderApp, historyApp)
     orderApp.actionLog = app.actionLog
     focusSymbol = ("SPY", "STK", "SMART")
     secondarySymbol = ("SPX", "IND", "CBOE")
@@ -28,9 +43,17 @@ async def main():
     vix = ("VIX", "IND", "CBOE")
 
     historyCandles = {}
+    scheduler.historySymbols = focusSymbol
 
     app.candleData = historyCandles
     historyApp.candleData = historyCandles
+    app.additionalTilesFuncs.append({
+        "function": scheduler.printEnhancedPredictions,
+        "title": "Enhanced Predictions",
+        "colspan": 3
+    })
+    app.additionalTilesFuncs.append(scheduler.get_jobs_dataframe)
+    app.additionalTilesFuncs.append(scheduler.printPredictions)
     print("Connecting to TWS/IB Gateway...")
     app.connect("127.0.0.1", 7497, clientId=1)  # Use your connection parameters.
     orderApp.connect("127.0.0.1", 7497, clientId=2)  # Use your connection parameters.
@@ -66,7 +89,7 @@ async def main():
     app.reqAllOpenOrders()
     
     symbols = [focusSymbol,vix,thirdSymbol]
-    optionSymbols = [focusSymbol,thirdSymbol]
+    optionSymbols = [focusSymbol]
     app.request_market_data(symbols)
     app.fetch_options_data(optionSymbols)
     historyApp.reqHistoricalDataFor(*vix, False, "2 D", "1 day")
@@ -78,5 +101,16 @@ async def main():
         await asyncio.sleep(10)
 
 if __name__ == "__main__":
+    # Run single-instance check only when executed directly
+    if is_already_running():
+        print("Another instance is already running. Exiting.")
+        sys.exit(1)
+
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
     with keep.running():
-        asyncio.run(main())
+        try:
+            asyncio.run(main())
+        finally:
+            os.remove(PID_FILE)  # Cleanup on exit

@@ -4,10 +4,22 @@ import pandas as pd
 import traceback
 
 class Api:
+    def set_cors_headers(self, response):
+        """Set CORS headers for the response."""
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
     def __init__(self, server: Flask, app, orderApp, config_file: str):
         self.server = server
         self.app = app
         self.config_file = config_file
+
+        # allow corss for all routes
+        self.server.after_request(self.set_cors_headers)
+
+    
 
         @self.server.route("/api/all", methods=["GET"])
         def getAll():
@@ -41,7 +53,11 @@ class Api:
             else:
                 return jsonify({"error": "No data available"}), 400
 
-
+        @self.server.route("/api/time", methods=["GET"])
+        def getTime():
+            """Endpoint to fetch the current time."""
+            current_time = pd.Timestamp.now()
+            return jsonify({"current_time": current_time.strftime("%Y-%m-%d %H:%M:%S")})
             
         @self.server.route("/api/options", methods=["GET"])
         def getOptions():

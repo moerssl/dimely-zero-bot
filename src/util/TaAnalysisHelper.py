@@ -41,11 +41,15 @@ def calc_ta_indicators(df, cfg):
     high_arr = df["high"].values.astype(float)
     low_arr = df["low"].values.astype(float)
     close_arr = df["close"].values.astype(float)
+    volume = df["volume"].values.astype(float)
     
     df["SMA5"] = talib.SMA(close_arr, timeperiod=cfg["ta"]["sma_timeperiod"])
     df["EMA5"] = talib.EMA(close_arr, timeperiod=5)
     df["EMA2"] = talib.EMA(close_arr, timeperiod=2)
     df["EMA8"] = talib.EMA(close_arr, timeperiod=8)
+    df["EMA20"] = talib.EMA(close_arr, timeperiod=20)
+    df["EMA50"] = talib.EMA(close_arr, timeperiod=50)
+
     df["RSI"] = talib.RSI(close_arr, timeperiod=cfg["ta"]["rsi_timeperiod"])
     df["STOCH_K"], df["STOCH_d"] = talib.STOCH(high_arr,low_arr,close_arr)
     
@@ -74,9 +78,19 @@ def calc_ta_indicators(df, cfg):
     df["doji"] = talib.CDLDOJI(open_arr, high_arr, low_arr, close_arr)
     df["hammer"] = talib.CDLHAMMER(open_arr, high_arr, low_arr, close_arr)
     df["adx"] = talib.ADX(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
+    df["PLUS_DI"] = talib.PLUS_DI(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
+    df["MINUS_DI"] = talib.MINUS_DI(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
+
     
     # Create a new column for the gap
     df['night_gap'] = df['open'] - df['close'].shift(1)
+
+    # VWAP (rolling)
+    #df["VWAP"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum() / df["volume"].cumsum()
+    # use variables defined above
+    df["VWAP"] = (volume * (high_arr + low_arr + close_arr) / 3).cumsum() / volume.cumsum()
+
+
     
     return df
 
@@ -94,39 +108,152 @@ def calc_atr_and_volatility(df, cfg):
 
 # 4. Calculate technical signal from Bollinger bands and RSI
 def calc_technical_signal(df, atr, cfg):
-    high_arr = df["high"].values.astype(float)
-    low_arr = df["low"].values.astype(float)
-    close_arr = df["close"].values.astype(float)
-    upperband = df["bb_up"].values
-    lowerband = df["bb_low"].values
-    middleband = df["bb_mid"].values
-    rsi = df["RSI"].values
-    hammer = df["hammer"].values
-    doji = df["doji"].values
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
 
-    tech_signal = np.where(
-        (high_arr > upperband - atr * cfg["signal"]["atr_multiplier"]) & ((rsi > cfg["signal"]["rsi_overbought"]) | (hammer > 0) | (doji > 0)),
-        StrategyEnum.SellCall,
-        np.where(
-            (low_arr < lowerband + atr * cfg["signal"]["atr_multiplier"]) & ((rsi < cfg["signal"]["rsi_oversold"]) | (hammer > 0) | (doji > 0)),
-            StrategyEnum.SellPut,
-            np.where(
-                (df["ATR_percent"].values < cfg["signal"]["iron_condor_atr_thresh"]) &
-                (np.abs(close_arr - middleband) < cfg["signal"]["iron_condor_body_thresh"] * atr) &
-                (rsi > cfg["signal"]["rsi_oversold"]) & (rsi < cfg["signal"]["rsi_overbought"]),
-                StrategyEnum.SellIronCondor,
-                StrategyEnum.Hold
-            )
-        )
+    upper = df["bb_up"]
+    lower = df["bb_low"]
+    middle = df["bb_mid"]
+    rsi = df["RSI"]
+    atr_percent = df["ATR_percent"]
+
+    # Candlestick signal: treat as one vote
+    candlestick_signal = ((df["doji"] > 0) | (df["hammer"] > 0)).astype(int)
+
+    # Signal components
+    near_upper = (high > (upper - atr * cfg["signal"]["atr_multiplier"])).astype(int)
+    near_lower = (low < (lower + atr * cfg["signal"]["atr_multiplier"])).astype(int)
+    near_middle = ((close - middle).abs() < cfg["signal"]["iron_condor_body_thresh"] * atr).astype(int)
+
+    # Vote counts
+    call_votes = (
+        near_upper +
+        (rsi > cfg["signal"]["rsi_overbought"]).astype(int) +
+        candlestick_signal
     )
-    df["tech_signal"] = tech_signal
+
+    put_votes = (
+        near_lower +
+        (rsi < cfg["signal"]["rsi_oversold"]).astype(int) +
+        candlestick_signal
+    )
+
+    ic_votes = (
+        (atr_percent < cfg["signal"]["iron_condor_atr_thresh"]).astype(int) +
+        near_middle +
+        ((rsi > cfg["signal"]["rsi_oversold"]) & (rsi < cfg["signal"]["rsi_overbought"])).astype(int)
+    )
+
+    # Assign final strategy
+    df["tech_signal"] = np.select(
+        [
+            call_votes >= 2,
+            put_votes >= 2,
+            ic_votes >= 3
+        ],
+        [
+            StrategyEnum.SellCall,
+            StrategyEnum.SellPut,
+            StrategyEnum.SellIronCondor
+        ],
+        default=StrategyEnum.Hold
+    )
+
     return df
+
+
+import numpy as np
+
+def detect_signals(df):
+    df["ema_bull"] = (df["EMA20"] > df["EMA50"]) & (df["EMA20"] > df["EMA20"].shift(1))
+    df["ema_bear"] = (df["EMA20"] < df["EMA50"]) & (df["EMA20"] < df["EMA20"].shift(1))
+
+    df["macd_bull"] = df["MACD"] > df["MACDSignal"]
+    df["macd_bear"] = df["MACD"] < df["MACDSignal"]
+
+    df["macd_hist_slope"] = df["MACDHist"] - df["MACDHist"].shift(1)
+    df["macd_hist_bull"] = df["macd_hist_slope"] > 0
+    df["macd_hist_bear"] = df["macd_hist_slope"] < 0
+
+    df["rsi_slope"] = df["RSI"] - df["RSI"].shift(1)
+    df["rsi_bull"] = df["rsi_slope"] > 0
+    df["rsi_bear"] = df["rsi_slope"] < 0
+
+    df["adx_strong"] = df["adx"] > 20
+
+    df["rsi_exhaustion_bull"] = (df["RSI"] > 70) & df["rsi_bear"]
+    df["rsi_exhaustion_bear"] = (df["RSI"] < 30) & df["rsi_bull"]
+
+    df["macd_exhaustion_bull"] = df["macd_bull"] & (df["macd_hist_slope"] < 0)
+    df["macd_exhaustion_bear"] = df["macd_bear"] & (df["macd_hist_slope"] > 0)
+
+    df["adx_exhaustion"] = (df["adx"] > 20) & (df["adx"].diff() < 0)
+
+    df["volatility_low"] = df["ATR_percent"] < 0.3  # configurable threshold
+    return df
+
+
+
+def classify_momentum(df):
+    df = detect_signals(df)
+
+    # Bullische Stimmen (PUT Credit Spreads)
+    df["bullish_votes"] = (
+        df["ema_bull"].astype(int) +
+        df["macd_bull"].astype(int) +
+        df["macd_hist_bull"].astype(int) +
+        df["rsi_bull"].astype(int) +
+        df["adx_strong"].astype(int)
+    )
+
+    # Bärische Stimmen (CALL Credit Spreads)
+    df["bearish_votes"] = (
+        df["ema_bear"].astype(int) +
+        df["macd_bear"].astype(int) +
+        df["macd_hist_bear"].astype(int) +
+        df["rsi_bear"].astype(int) +
+        df["adx_strong"].astype(int)
+    )
+
+    # Momentum-Erschöpfung berücksichtigen
+    df["bullish_exhaustion"] = (
+        df["rsi_exhaustion_bull"].astype(int) +
+        df["macd_exhaustion_bull"].astype(int) +
+        df["adx_exhaustion"].astype(int)
+    )
+
+    df["bearish_exhaustion"] = (
+        df["rsi_exhaustion_bear"].astype(int) +
+        df["macd_exhaustion_bear"].astype(int) +
+        df["adx_exhaustion"].astype(int)
+    )
+
+    # Finales Sentiment unter Berücksichtigung der Erschöpfung
+    df["sentiment"] = np.select(
+        [
+            (df["bullish_votes"] >= 4) & df["volatility_low"] & (df["bullish_exhaustion"] == 0),
+            (df["bearish_votes"] >= 4) & df["volatility_low"] & (df["bearish_exhaustion"] == 0),
+            (df["bullish_exhaustion"] >= 2),
+            (df["bearish_exhaustion"] >= 2),
+        ],
+        ["bullish", "bearish", "bullish_exhaustion", "bearish_exhaustion"],
+        default="neutral"
+    )
+
+    return df
+
+
 
 # 5. Determine trend using SMA5
 def calc_trend(df):
     close_arr = df["close"].values.astype(float)
     sma5 = df["SMA5"].values
     df["trend"] = np.where(close_arr > sma5, "UP", "DOWN")
+    try:
+        df = classify_momentum(df)
+    except Exception as e:
+        print("Error classifying momentum: ", e)
     return df
 
 # 6. Time-based indicators
@@ -260,8 +387,8 @@ def calc_probabilities(df, current_price, remaining_std_dev):
             c_dist = ((df.loc[valid_mask, "call_strike"] - current_price) / current_price * 100).round(2)
             p_dist = ((current_price - df.loc[valid_mask, "put_strike"]) / current_price * 100).round(2)
 
-            df.loc[valid_mask, "c_dist_p"] = pd.Series(c_dist, index=c_dist.index)
-            df.loc[valid_mask, "p_dist_p"] = pd.Series(p_dist, index=p_dist.index)
+            df.loc[valid_mask, "c_dist"] = pd.Series(c_dist, index=c_dist.index)
+            df.loc[valid_mask, "p_dist"] = pd.Series(p_dist, index=p_dist.index)
 
     except Exception as e:
         print("Error calculating probabilities: ", e)

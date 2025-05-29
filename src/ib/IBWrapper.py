@@ -9,7 +9,7 @@ from ibapi.utils import iswrapper
 from ibapi.common import *
 import pandas as pd
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 import numpy as np
 
@@ -23,11 +23,13 @@ class IBWrapper(EWrapper):
         self.market_data = pd.DataFrame(columns=["Symbol", "DateTime", "Price"])
         with self.optionsDataLock:
             self.options_data = pd.DataFrame(columns=[
-                "Id", "Symbol", "Strike", "dist", "undPrice", "Type", "delta", "bid", "ask", "bid_size", "ask_size", "last", "Expiry",
+                "Id", "Symbol", "Strike", "dist", "undPrice", "Type", "delta", "bid", "ask", "time", "bid_size", "ask_size", "last", "Expiry",
                 "close", "high", "low",
                 "ConId", "UnderConId", "impliedVol", "optPrice", "pvDividend", "gamma", "vega", "theta", "delta_diff"
             ])
             self.options_data.set_index('Id', inplace=True)
+            self.options_data['time'] = pd.to_datetime(self.options_data['time'], utc=True, errors='coerce')
+
         self.market_data.set_index('Symbol', inplace=False)
 
 
@@ -68,6 +70,8 @@ class IBWrapper(EWrapper):
     
     @iswrapper
     def tickOptionComputation(self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice):
+        if not reqId in self.req_ids:
+            return super().tickOptionComputation(reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice)
         entry = self.req_ids[reqId]
         text = TickTypeEnum.toStr(tickType).lower()
 
@@ -92,19 +96,23 @@ class IBWrapper(EWrapper):
 
 
                 self.options_data.loc[id, "impliedVol"] = impliedVol
-                self.options_data.loc[id, "delta"] = delta
+                self.options_data.loc[id, "delta"] = round(delta,3) if delta is not None else delta
                 self.options_data.loc[id, "optPrice"] = optPrice
                 self.options_data.loc[id, "pvDividend"] = pvDividend
                 self.options_data.loc[id, "gamma"] = gamma
                 self.options_data.loc[id, "vega"] = vega
                 self.options_data.loc[id, "theta"] = theta
-                self.options_data.loc[id, "undPrice"] = undPrice
+                self.options_data.loc[id, "undPrice"] = round(undPrice,2) if undPrice is not None else undPrice
+                self.options_data.loc[id, "time"] = datetime.now(timezone.utc)
                 
 
         return super().tickOptionComputation(reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice)
     
     @iswrapper
     def tickPrice(self, reqId: TickerId, tickType: TickType, price: float, attrib):
+        if not reqId in self.req_ids:
+            return super().tickPrice(reqId, tickType, price, attrib)
+        
         entry = self.req_ids[reqId]
         text = TickTypeEnum.toStr(tickType).lower()
 
@@ -125,9 +133,14 @@ class IBWrapper(EWrapper):
                       if not (val > 0):
                           text = delayed_text
                 self.options_data.loc[id, text] = price
+                self.options_data.loc[id, "time"] = datetime.now(timezone.utc)
+
 
     @iswrapper
     def tickSize(self, reqId, tickType, size):
+        if not reqId in self.req_ids:
+            return super().tickSize(reqId, tickType, size)
+        
         entry = self.req_ids[reqId]
         text = TickTypeEnum.toStr(tickType).lower()
 
@@ -142,6 +155,8 @@ class IBWrapper(EWrapper):
                           text = delayed_text
 
                 self.options_data.loc[id, text] = size
+                self.options_data.loc[id, "time"] = datetime.now(timezone.utc)
+
         return super().tickSize(reqId, tickType, size)
     def cleanPrices(self):
         # Check if the necessary columns are in the DataFrame

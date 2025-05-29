@@ -32,8 +32,8 @@ def catch_up(app, historyAdapter, orderAdapter, focusSymbol):
     try:
         app.addToActionLog("Catching up...")
         #app.setMarketDataType()
-        app.fetch_positions()
-        sleep(0.5)
+        #app.fetch_positions()
+        #sleep(0.5)
         historyAdapter.reqHistoricalDataFor(*focusSymbol, True)
 
         sleep(0.5)
@@ -77,13 +77,12 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
     display_data = True
     while True:
         schedule.run_pending()
-        enchance_order_data(orderAdapter, app, symbol)
         # Clear the screen
         screen.clear()
         # Get screen dimensions
         height, width = screen.getmaxyx()
 
-        app.cleanPrices()
+        #app.cleanPrices()
 
         if (display_data):
             data: list = app.getTilesData(symbol)
@@ -97,7 +96,7 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
             }
             
 
-            data.append(freeToTrade)
+            #data.append(freeToTrade)
 
             # Determine number of columns using your heuristic.
             num_tiles = len(data)
@@ -147,7 +146,12 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
                         for i, line in enumerate(content):
                             if i < tile_height - 1:  # leave a row for the title
                                 screen.addstr(current_y + i + 1, current_x, str(line)[:tile_width-1])
-                    
+                    elif isinstance(content, dict):
+                        # If content is a dictionary, format it as a string.
+                        formatted_content = "\n".join([f"{k}: {v}" for k, v in content.items()])
+                        for i, line in enumerate(formatted_content.split('\n')):
+                            if i < tile_height - 1:
+                                screen.addstr(current_y + i + 1, current_x, line[:tile_width-1])
                     else:
                         # If content has a "columns" attribute, assume it's a DataFrame.
                         if hasattr(content, "columns"):

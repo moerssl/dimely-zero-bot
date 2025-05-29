@@ -19,7 +19,8 @@ class ExpectedValueTrader():
         try:
             df = self.options_data[
                 (self.options_data['Symbol'] == symbol) &
-                (self.options_data['delta'].abs() <= 0.5) &
+                (self.options_data['delta'] <= 0.5) &
+                (self.options_data['delta'] >= -0.5) &
                 (self.options_data['bid'] > 0) &
                 (self.options_data['ask'] > 0)
             ]
@@ -239,13 +240,21 @@ class ExpectedValueTrader():
 
         if short_leg is None or long_leg is None:
             return None
+        
+        Δ_SP        = short_leg["delta"]   # P(short ITM)
+        Δ_LP        = long_leg["delta"]    # P(long  ITM)
+
+        if Δ_SP is None or Δ_LP is None:
+            return None
+        
+
 
         short_bid   = short_leg["bid"]
         long_ask    = long_leg["ask"]
         K_short     = short_leg["Strike"]
         K_long      = long_leg["Strike"]
-        Δ_SP        = abs(short_leg["delta"])   # P(short ITM)
-        Δ_LP        = abs(long_leg["delta"])    # P(long  ITM)
+        Δ_SP        = abs(Δ_SP)   # P(short ITM)
+        Δ_LP        = abs(Δ_LP)    # P(long  ITM)
 
         # --- basic checks & credit/loss geometry ---
         net_credit    = short_bid - long_ask
