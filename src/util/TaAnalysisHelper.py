@@ -47,6 +47,7 @@ def calc_ta_indicators(df, cfg):
     df["EMA5"] = talib.EMA(close_arr, timeperiod=5)
     df["EMA2"] = talib.EMA(close_arr, timeperiod=2)
     df["EMA8"] = talib.EMA(close_arr, timeperiod=8)
+    df["EMA13"] = talib.EMA(close_arr, timeperiod=13)
     df["EMA20"] = talib.EMA(close_arr, timeperiod=20)
     df["EMA50"] = talib.EMA(close_arr, timeperiod=50)
 
@@ -77,19 +78,37 @@ def calc_ta_indicators(df, cfg):
     
     df["doji"] = talib.CDLDOJI(open_arr, high_arr, low_arr, close_arr)
     df["hammer"] = talib.CDLHAMMER(open_arr, high_arr, low_arr, close_arr)
+    df["engulfing"] = talib.CDLENGULFING(open_arr, high_arr, low_arr, close_arr)
     df["adx"] = talib.ADX(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
     df["PLUS_DI"] = talib.PLUS_DI(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
     df["MINUS_DI"] = talib.MINUS_DI(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
 
     
     # Create a new column for the gap
-    df['night_gap'] = df['open'] - df['close'].shift(1)
+    df['night_gap'] = (df['open'] - df['close'].shift(1)).round(2)
 
     # VWAP (rolling)
     #df["VWAP"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum() / df["volume"].cumsum()
     # use variables defined above
     df["VWAP"] = (volume * (high_arr + low_arr + close_arr) / 3).cumsum() / volume.cumsum()
 
+    # Dynamic RSI thresholds based on recent extremes
+    df["rsi_dynamic_thresh_high"] = df["RSI"].rolling(window=10).max() * 0.95
+    df["rsi_dynamic_thresh_low"] = df["RSI"].rolling(window=10).min() * 1.05
+
+
+
+    # Improved volume spike detection
+    df["vol_spike"] = (df["volume"] > df["volume"].rolling(window=20).mean() * 2).astype(int)
+
+    # Replace NaN IV values with the last valid observation
+    df["IV_close"] = df["IV_close"].fillna(method="ffill")
+
+    # If NaN persists (e.g., beginning of the dataset), replace it with the rolling mean
+    df["IV_close"] = df["IV_close"].fillna(df["IV_close"].rolling(window=10, min_periods=1).mean())
+
+    df["IV_rank"] = (df["IV_close"] - df["IV_close"].rolling(window=50).min()) / \
+                    (df["IV_close"].rolling(window=50).max() - df["IV_close"].rolling(window=50).min())
 
     
     return df
@@ -104,70 +123,335 @@ def calc_atr_and_volatility(df, cfg):
     atr_percent = (atr / close_arr) * 100
     df["ATR"] = atr
     df["ATR_percent"] = atr_percent
+        # Adjusted ATR scaling based on historical quartile
+    df["atr_adjusted"] = df["ATR_percent"].rolling(window=20).quantile(0.25)
     return df, atr, atr_percent
 
-# 4. Calculate technical signal from Bollinger bands and RSI
+
+
+
+
 def calc_technical_signal(df, atr, cfg):
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
+    """
+    Compute tech signals:
+      - SellCall on bearish setups (price falling)
+      - SellPut  on bullish setups (price rising)
+      - SellIronCondor on low-vol neutrality/squeeze 
+    Tie-breaking uses “method 2”: pick the highest vote ≥ its own threshold.
+    Assumes numpy (np), pandas (pd), talib and StrategyEnum are in scope.
+    """
+    # 1) Cast series
+    high    = df["high"].astype(float)
+    low     = df["low"].astype(float)
+    close   = df["close"].astype(float)
+    rsi     = df["RSI"].astype(float)
+    atr_pct = df["ATR_percent"].astype(float)
+    adx     = df["adx"].astype(float)
+    pdi     = df["PLUS_DI"].astype(float)
+    mdi     = df["MINUS_DI"].astype(float)
+    vwap    = df["VWAP"].astype(float)
+    macdh   = df["MACDHist"].astype(float)
+    ema5    = df["EMA5"].astype(float)
+    ema20   = df["EMA20"].astype(float)
+    vol     = df["volume"].astype(float)
 
-    upper = df["bb_up"]
-    lower = df["bb_low"]
-    middle = df["bb_mid"]
-    rsi = df["RSI"]
-    atr_percent = df["ATR_percent"]
+    upper   = df["bb_up"]
+    lower   = df["bb_low"]
+    middle  = df["bb_mid"]
 
-    # Candlestick signal: treat as one vote
-    candlestick_signal = ((df["doji"] > 0) | (df["hammer"] > 0)).astype(int)
+    # 2) Config shortcuts
+    sig = cfg["signal"]
+    lo, hi     = sig["rsi_oversold"],   sig["rsi_overbought"]
+    ct, pt, it = sig["call_thresh"],    sig["put_thresh"],    sig["iron_condor_thresh"]
 
-    # Signal components
-    near_upper = (high > (upper - atr * cfg["signal"]["atr_multiplier"])).astype(int)
-    near_lower = (low < (lower + atr * cfg["signal"]["atr_multiplier"])).astype(int)
-    near_middle = ((close - middle).abs() < cfg["signal"]["iron_condor_body_thresh"] * atr).astype(int)
+    # 3) RSI cross-inside events
+    rsi_bull = ((rsi.shift(1) <  lo) & (rsi >= lo)).astype(int)  # crosses up into >30
+    rsi_bear = ((rsi.shift(1) >  hi) & (rsi <= hi)).astype(int)  # crosses down into <70
 
-    # Vote counts
+    # 4) Bollinger proximities
+    near_low  = (low  < lower + atr*sig["atr_multiplier"]).astype(int)
+    near_high = (high > upper - atr*sig["atr_multiplier"]).astype(int)
+    near_mid  = ((close - middle).abs() < sig["iron_condor_body_thresh"] * atr).astype(int)
+
+    # 5) ADX + DI direction
+    adx_ok  = (adx > sig["adx_thresh"]).astype(int)
+    di_up   = (pdi > mdi).astype(int)
+    di_down = (mdi > pdi).astype(int)
+
+    # 6) VWAP, MACD, EMA‐crosses
+    above_vwap = (close > vwap).astype(int)
+    below_vwap = (close < vwap).astype(int)
+    macd_pos   = (macdh > 0).astype(int)
+    macd_neg   = (macdh < 0).astype(int)
+    ema_up     = ((ema5 > ema20) & (ema5.shift(1) <= ema20.shift(1))).astype(int)
+    ema_down   = ((ema5 < ema20) & (ema5.shift(1) >= ema20.shift(1))).astype(int)
+
+    # 7) Candlestick + volume spike
+    engulf = talib.CDLENGULFING(df["open"], high, low, close).fillna(0).astype(int)
+    bull_cndl = ((engulf > 0) & (vol > vol.rolling(sig["vol_window"]).mean() * sig["vol_mult"])).astype(int)
+    bear_cndl = ((engulf < 0) & (vol > vol.rolling(sig["vol_window"]).mean() * sig["vol_mult"])).astype(int)
+
+    # 8) Iron-condor filters: dynamic & static ATR + BB squeeze
+    rolling_atr_q = atr_pct.rolling(sig["atr_window"], min_periods=1) \
+                               .quantile(sig["atr_quantile"])
+    low_vol_dyn = (atr_pct < rolling_atr_q).astype(int)
+    low_vol_stat= (atr_pct < sig["iron_condor_atr_thresh"]).astype(int)
+    bb_width    = (upper - lower) / middle
+    squeeze     = (bb_width < sig["bb_squeeze_thresh"]).astype(int)
+
+    # 9) Build vote-stacks
     call_votes = (
-        near_upper +
-        (rsi > cfg["signal"]["rsi_overbought"]).astype(int) +
-        candlestick_signal
+        near_low
+      + rsi_bear
+      + bear_cndl
+      + adx_ok * di_down
+      + below_vwap
+      + macd_neg
+      + ema_down
     )
 
     put_votes = (
-        near_lower +
-        (rsi < cfg["signal"]["rsi_oversold"]).astype(int) +
-        candlestick_signal
+        near_high
+      + rsi_bull
+      + bull_cndl
+      + adx_ok * di_up
+      + above_vwap
+      + macd_pos
+      + ema_up
     )
 
     ic_votes = (
-        (atr_percent < cfg["signal"]["iron_condor_atr_thresh"]).astype(int) +
-        near_middle +
-        ((rsi > cfg["signal"]["rsi_oversold"]) & (rsi < cfg["signal"]["rsi_overbought"])).astype(int)
+        low_vol_dyn
+      + low_vol_stat
+      + near_mid
+      + ((rsi > lo) & (rsi < hi)).astype(int)
+      + squeeze
     )
 
-    # Assign final strategy
-    df["tech_signal"] = np.select(
-        [
-            call_votes >= 2,
-            put_votes >= 2,
-            ic_votes >= 3
-        ],
-        [
-            StrategyEnum.SellCall,
-            StrategyEnum.SellPut,
-            StrategyEnum.SellIronCondor
-        ],
-        default=StrategyEnum.Hold
-    )
+    # 10) Method 2: tie-break via argmax over vote columns
+    votes_df = pd.DataFrame({
+        "call": call_votes,
+        "put":  put_votes,
+        "ic":   ic_votes
+    }, index=df.index)
+
+    # zero-out any votes below their own threshold
+    votes_df["call"] = votes_df["call"].where(votes_df["call"] >= ct, -1)
+    votes_df["put"]  = votes_df["put"].where(votes_df["put"]   >= pt, -1)
+    votes_df["ic"]   = votes_df["ic"].where(votes_df["ic"]     >= it, -1)
+
+    # pick the column with the highest (>= thresh) vote
+    winner = votes_df.idxmax(axis=1)
+
+    mapping = {
+        "call": StrategyEnum.SellCall,
+        "put":  StrategyEnum.SellPut,
+        "ic":   StrategyEnum.SellIronCondor
+    }
+
+    df["tech_signal"] = winner.map(mapping).fillna(StrategyEnum.Hold)
+
+    # 11) Optional regime-gates: IV & ATR filters
+    if "implied_vol" in df and "iv_threshold" in sig:
+        iv = df["implied_vol"].astype(float)
+        df.loc[iv < sig["iv_threshold"], "tech_signal"] = StrategyEnum.Hold
+
+    if "atr_threshold" in sig:
+        df.loc[atr_pct < sig["atr_threshold"], "tech_signal"] = StrategyEnum.Hold
 
     return df
 
+"""
 
-import numpy as np
+def calc_technical_signal(df, atr, cfg):
+    try:
+
+        # 1. Ensure IV columns are forward‐filled and compute IV_rank if missing
+        if "IV_close" in df.columns:
+            df["IV_close"] = df["IV_close"].fillna(method="ffill")
+            df["IV_close"] = df["IV_close"].fillna(df["IV_close"].rolling(window=10, min_periods=1).mean())
+            if "IV_rank" not in df.columns:
+                iv_min = df["IV_close"].rolling(window=50, min_periods=1).min()
+                iv_max = df["IV_close"].rolling(window=50, min_periods=1).max()
+                df["IV_rank"] = (df["IV_close"] - iv_min) / (iv_max - iv_min + 1e-9)
+        else:
+            df["IV_rank"] = 0.0
+
+        # 2. Bollinger Squeeze: narrow band detection
+        #    Squeeze if (upper - lower) / middle < threshold
+        bb_mid = df["bb_mid"].astype(float)
+        bb_up = df["bb_up"].astype(float)
+        bb_low = df["bb_low"].astype(float)
+        bb_width_ratio = (bb_up - bb_low) / (bb_mid + 1e-9)  # avoid division by zero
+        df["bb_squeeze"] = (bb_width_ratio < cfg["signal"]["bb_squeeze_thresh"]).astype(int)
+
+        # 3. ADX Trend Filter: identify if market has a defined trend
+        #    We'll require ADX > adx_thresh to consider directional signals
+        adx = df["adx"].astype(float).fillna(0.0)
+        trend_strong = (adx >= cfg["signal"]["adx_thresh"]).astype(int)
+
+        # 4. Directional Bias via MACD and EMAs
+        #    - For SellCall: market is weak (bearish): MACD < 0, EMA short < EMA mid, and ATR‐normalized
+        #    - For SellPut: market is strong (bullish): MACD > 0, EMA short > EMA mid
+        macd = df["MACD"].astype(float).fillna(0.0)
+        ema_short = df["EMA5"].astype(float).fillna(method="ffill")
+        ema_mid = df["EMA20"].astype(float).fillna(method="ffill")
+
+        sell_call_trend = (
+            (macd < 0).astype(int)
+            & (ema_short < ema_mid).astype(int)
+            & (trend_strong == 1)
+        )
+        sell_put_trend = (
+            (macd > 0).astype(int)
+            & (ema_short > ema_mid).astype(int)
+            & (trend_strong == 1)
+        )
+
+        # 5. RSI Confirmation
+        rsi = df["RSI"].astype(float).fillna(50.0)
+        call_rsi_ok = (rsi > cfg["signal"]["rsi_oversold"]).astype(int)   # avoid oversold bounces
+        put_rsi_ok = (rsi < cfg["signal"]["rsi_overbought"]).astype(int)   # avoid overbought pullbacks
+
+        # 6. Bollinger‐Band Reversion
+        #    If previous close was near outer band and current price has moved ~50% back to mid‐band
+        close = df["close"].astype(float)
+        prev_close = close.shift(1)
+        prev_bb_up = bb_up.shift(1)
+        prev_bb_low = bb_low.shift(1)
+        atr_val = pd.Series(atr, index=df.index).fillna(method="ffill")
+
+        prev_near_upper = (prev_close >= prev_bb_up - cfg["signal"]["atr_multiplier"] * atr_val).astype(int)
+        curr_dist_up_mid = close - bb_mid
+        max_up_diff = bb_up - bb_mid
+        call_bb_reversion = ((prev_near_upper == 1) & (curr_dist_up_mid < 0.5 * max_up_diff)).astype(int)
+
+        prev_near_lower = (prev_close <= prev_bb_low + cfg["signal"]["atr_multiplier"] * atr_val).astype(int)
+        curr_dist_low_mid = bb_mid - close
+        max_low_diff = bb_mid - bb_low
+        put_bb_reversion = ((prev_near_lower == 1) & (curr_dist_low_mid < 0.5 * max_low_diff)).astype(int)
+
+        # 7. Volume Spike: leverage existing 'vol_spike' (1 if volume > vol_mult * rolling mean)
+        vol_spike = df["vol_spike"].astype(int)
+
+        # 8. Common “non‐directional” Votes
+        #    Count: candlestick patterns, volume spike, squeeze, and high IV
+        doji = (df.get("doji", 0) != 0).astype(int)
+        hammer = (df.get("hammer", 0) != 0).astype(int)
+        engulfing = (df.get("engulfing", 0) != 0).astype(int)
+        candle_pattern = ((doji | hammer | engulfing) > 0).astype(int)
+
+        iv_high = (df["IV_rank"] > cfg["signal"]["volatility_min"]).astype(int)
+        common_votes = candle_pattern + vol_spike + df["bb_squeeze"].astype(int) + iv_high
+
+        # 9. ATR‐Normalized Volatility Filter
+        #    Only consider options trades when ATR_pct > threshold or in relative bottom quantile
+        atr_pct = df["ATR_percent"].astype(float).fillna(0.0)
+        low_atr_condition = (
+            (atr_pct >= cfg["signal"]["atr_threshold"]).astype(int)
+            | (df["atr_adjusted"] <= df["atr_adjusted"].rolling(window=cfg["signal"]["atr_window"], min_periods=1).quantile(cfg["signal"]["atr_quantile"]))
+        ).astype(int)
+
+        # 10. IV Threshold: require a minimum IV for selling premium
+        iv_condition = (df["IV_rank"] >= cfg["signal"]["iv_threshold"]).astype(int)
+
+        # 11. Iron Condor Neutral Signal
+        #     Looking for low volatility, price near middle band, and RSI in mid‐range
+        near_mid = (np.abs(close - bb_mid) < cfg["signal"]["iron_condor_body_thresh"] * atr_val).astype(int)
+        rsi_in_mid = ((rsi > df["rsi_dynamic_thresh_low"]) & (rsi < df["rsi_dynamic_thresh_high"])).astype(int)
+        low_volatility = (df["atr_adjusted"] < cfg["signal"]["iron_condor_atr_thresh"]).astype(int)
+        ic_votes = low_volatility + near_mid + rsi_in_mid + df["bb_squeeze"].astype(int)
+
+        # 12. Combine directional and common votes into scalar scores
+        #     Weights can be tuned; here is a balanced approach:
+        directional_call_score = (
+            2.0 * sell_call_trend
+            + 1.5 * call_bb_reversion
+            + 1.0 * call_rsi_ok
+            + 0.5 * trend_strong
+        )
+        directional_put_score = (
+            2.0 * sell_put_trend
+            + 1.5 * put_bb_reversion
+            + 1.0 * put_rsi_ok
+            + 0.5 * trend_strong
+        )
+        common_score = 1.0 * candle_pattern + 1.0 * vol_spike + 1.0 * df["bb_squeeze"].astype(int) + 1.0 * iv_high
+
+        # 13. Thresholds from config
+        common_min = cfg["signal"].get("common_threshold", 2)  # require at least 2 “common” votes
+        call_thresh = cfg["signal"]["call_thresh"]
+        put_thresh = cfg["signal"]["put_thresh"]
+        ic_thresh = cfg["signal"]["iron_condor_thresh"]
+        tie_tolerance = cfg.get("tie_tolerance", 0.5)
+
+        # 14. Decide final signal row‐by‐row
+        def decide_strategy(idx):
+            c_score = common_score.iloc[idx]
+            if c_score < common_min:
+                return StrategyEnum.Hold
+
+            # Check IV and ATR conditions
+            if (iv_condition.iloc[idx] == 0) or (low_atr_condition.iloc[idx] == 0):
+                # If IV or ATR conditions fail, default to Hold
+                return StrategyEnum.Hold
+
+            d_call = directional_call_score.iloc[idx]
+            d_put = directional_put_score.iloc[idx]
+            d_ic = ic_votes.iloc[idx]
+
+            # If only one directional side is valid
+            if (d_call >= call_thresh) and (d_put < put_thresh):
+                return StrategyEnum.SellCall
+            if (d_put >= put_thresh) and (d_call < call_thresh):
+                return StrategyEnum.SellPut
+
+            # If both directions exceed their thresholds
+            if (d_call >= call_thresh) and (d_put >= put_thresh):
+                if abs(d_call - d_put) < tie_tolerance:
+                    # Ambiguous: prefer neutral iron condor if also strong
+                    if d_ic >= ic_thresh:
+                        return StrategyEnum.SellIronCondor
+                    else:
+                        return StrategyEnum.Hold
+                else:
+                    return StrategyEnum.SellCall if d_call > d_put else StrategyEnum.SellPut
+
+            # If neither directional side qualifies but neutral is strong
+            if d_ic >= ic_thresh:
+                return StrategyEnum.SellIronCondor
+
+            return StrategyEnum.Hold
+
+        # 15. Apply vectorized scoring columns for debugging/analysis
+        df["directional_call_score"] = directional_call_score
+        df["directional_put_score"] = directional_put_score
+        df["common_score"] = common_score
+        df["ic_votes"] = ic_votes
+
+        # 16. Compute final 'tech_signal' column
+        df["tech_signal"] = [
+            decide_strategy(i) for i in range(len(df))
+        ]
+    except Exception as e:
+        print("Error calculating technical signal: ", e)
+        # Fallback to default strategy if any error occurs
+        df["tech_signal"] = StrategyEnum.Hold
+
+    return df
+"""
 
 def detect_signals(df):
-    df["ema_bull"] = (df["EMA20"] > df["EMA50"]) & (df["EMA20"] > df["EMA20"].shift(1))
-    df["ema_bear"] = (df["EMA20"] < df["EMA50"]) & (df["EMA20"] < df["EMA20"].shift(1))
+    EMA_FAST = "EMA8"
+    EMA_SLOW = "EMA13"
+    VWAP     = "VWAP"
+
+    df["ema_bull"] = (df[EMA_FAST] > df[EMA_SLOW]) & (df[EMA_FAST] > df[EMA_FAST].shift(1))
+    df["ema_bear"] = (df[EMA_FAST] < df[EMA_SLOW]) & (df[EMA_FAST] < df[EMA_FAST].shift(1))
+    # Predicting bullish cross soon (fast EMA approaching slow EMA)
+    df["ema_bull_soon"] = (df[EMA_FAST] > df[EMA_SLOW].shift(1)) & (df[EMA_FAST].shift(1) <= df[EMA_SLOW].shift(2))
+    df["ema_bear_soon"] = (df[EMA_FAST] < df[EMA_SLOW].shift(1)) & (df[EMA_FAST].shift(1) >= df[EMA_SLOW].shift(2))
+
 
     df["macd_bull"] = df["MACD"] > df["MACDSignal"]
     df["macd_bear"] = df["MACD"] < df["MACDSignal"]
@@ -191,49 +475,74 @@ def detect_signals(df):
     df["adx_exhaustion"] = (df["adx"] > 20) & (df["adx"].diff() < 0)
 
     df["volatility_low"] = df["ATR_percent"] < 0.3  # configurable threshold
+    
+    df["price_above_vwap"] = df["close"] > df[VWAP]
+    df["price_below_vwap"] = df["close"] < df[VWAP]
+
+    # 2) EMA-fast crossing VWAP
+    df["ema_vwap_bull"]      = (df[EMA_FAST] > df[VWAP]) & (df[EMA_FAST].shift(1) <= df[VWAP].shift(1))
+    df["ema_vwap_bear"]      = (df[EMA_FAST] < df[VWAP]) & (df[EMA_FAST].shift(1) >= df[VWAP].shift(1))
+
+    # 3) EMA-fast “soon” crossing VWAP
+    df["ema_vwap_bull_soon"] = (df[EMA_FAST] > df[VWAP].shift(1)) & (df[EMA_FAST].shift(1) <= df[VWAP].shift(2))
+    df["ema_vwap_bear_soon"] = (df[EMA_FAST] < df[VWAP].shift(1)) & (df[EMA_FAST].shift(1) >= df[VWAP].shift(2))
+
     return df
 
 
-
 def classify_momentum(df):
+    # 1) populate all flags
     df = detect_signals(df)
 
-    # Bullische Stimmen (PUT Credit Spreads)
-    df["bullish_votes"] = (
-        df["ema_bull"].astype(int) +
-        df["macd_bull"].astype(int) +
-        df["macd_hist_bull"].astype(int) +
-        df["rsi_bull"].astype(int) +
-        df["adx_strong"].astype(int)
-    )
+    # 2) list out every bullish/bearish momentum signal
+    bull_signals = [
+        "ema_bull",
+        "ema_bull_soon",
+        "ema_vwap_bull",
+        "ema_vwap_bull_soon",
+        "macd_bull",
+        "macd_hist_bull",
+        "rsi_bull",
+        "adx_strong",
+        "price_above_vwap"
+    ]
 
-    # Bärische Stimmen (CALL Credit Spreads)
-    df["bearish_votes"] = (
-        df["ema_bear"].astype(int) +
-        df["macd_bear"].astype(int) +
-        df["macd_hist_bear"].astype(int) +
-        df["rsi_bear"].astype(int) +
-        df["adx_strong"].astype(int)
-    )
+    bear_signals = [
+        "ema_bear",
+        "ema_bear_soon",
+        "ema_vwap_bear",
+        "ema_vwap_bear_soon",
+        "macd_bear",
+        "macd_hist_bear",
+        "rsi_bear",
+        "adx_strong",
+        "price_below_vwap"
+    ]
 
-    # Momentum-Erschöpfung berücksichtigen
+    # 3) sum them up
+    df["bullish_votes"] = df[bull_signals].sum(axis=1).astype(int)
+    df["bearish_votes"] = df[bear_signals].sum(axis=1).astype(int)
+
+    # 4) exhaustion still overrides
     df["bullish_exhaustion"] = (
         df["rsi_exhaustion_bull"].astype(int) +
         df["macd_exhaustion_bull"].astype(int) +
         df["adx_exhaustion"].astype(int)
     )
-
     df["bearish_exhaustion"] = (
         df["rsi_exhaustion_bear"].astype(int) +
         df["macd_exhaustion_bear"].astype(int) +
         df["adx_exhaustion"].astype(int)
     )
 
-    # Finales Sentiment unter Berücksichtigung der Erschöpfung
+    # 5) final sentiment logic
     df["sentiment"] = np.select(
         [
-            (df["bullish_votes"] >= 4) & df["volatility_low"] & (df["bullish_exhaustion"] == 0),
-            (df["bearish_votes"] >= 4) & df["volatility_low"] & (df["bearish_exhaustion"] == 0),
+            # enough bullish votes, low vol, no exhaustion
+            (df["bullish_votes"] >= 6) & df["volatility_low"] & (df["bullish_exhaustion"] == 0),
+            # enough bearish votes, low vol, no exhaustion
+            (df["bearish_votes"] >= 6) & df["volatility_low"] & (df["bearish_exhaustion"] == 0),
+            # exhaustion states
             (df["bullish_exhaustion"] >= 2),
             (df["bearish_exhaustion"] >= 2),
         ],
@@ -241,9 +550,25 @@ def classify_momentum(df):
         default="neutral"
     )
 
+    # --- now mark your spreads & final strategy ---
+    df["uptrend_confirm"]   = (df["close"] > df["VWAP"]) & (df["EMA8"] > df["EMA13"])
+    df["downtrend_confirm"] = (df["close"] < df["VWAP"]) & (df["EMA8"] < df["EMA13"])
+
+    df["sell_put_spread"]  = (df["sentiment"]=="bullish") & df["uptrend_confirm"]
+    df["sell_call_spread"] = (df["sentiment"]=="bearish") & df["downtrend_confirm"]
+
+    # 4) assign StrategyEnum
+    df["strategy"] = StrategyEnum.Hold
+    df.loc[df["sell_put_spread"],  "strategy"] = StrategyEnum.SellPut
+    df.loc[df["sell_call_spread"], "strategy"] = StrategyEnum.SellCall
+
+    # optional: when sentiment is neutral but vol is low → iron condor
+    df.loc[
+      (df["sentiment"]=="neutral") & df["volatility_low"],
+      "strategy"
+    ] = StrategyEnum.SellIronCondor
+
     return df
-
-
 
 # 5. Determine trend using SMA5
 def calc_trend(df):
@@ -401,33 +726,36 @@ def calc_probabilities(df, current_price, remaining_std_dev):
 def combine_signals(df):
     if (df.empty):
         return df
-    tech_signal = df["tech_signal"].values
-    prob_theshold = CONFIG["signal"]["prob_threshold"]
-    previous_tech_signal = np.roll(tech_signal, shift=1)
-    previous_tech_signal[0] = StrategyEnum.Hold  # default for first row
-    final_signal = np.where(
-        (previous_tech_signal == StrategyEnum.SellPut) &
-        (tech_signal == StrategyEnum.Hold) &
-        (df["put_p"].values >= prob_theshold) &
-        (df["ATR_percent"].values < 0.3),
-        StrategyEnum.SellPut,
-        np.where(
-            (previous_tech_signal == StrategyEnum.SellCall) &
-            (tech_signal == StrategyEnum.Hold) &
-            (df["call_p"].values >= prob_theshold) &
-            (df["ATR_percent"].values < 0.3),
-            StrategyEnum.SellCall,
+    try:
+        tech_signal = df["tech_signal"].values
+        prob_theshold = CONFIG["signal"]["prob_threshold"]
+        atr_thresh = CONFIG["signal"]["atr_threshold"]
+        previous_tech_signal = np.roll(tech_signal, shift=1)
+        previous_tech_signal[0] = StrategyEnum.Hold  # default for first row
+        final_signal = np.where(
+            (previous_tech_signal == StrategyEnum.SellPut) &
+            (tech_signal == StrategyEnum.SellPut) &
+            (df["put_p"].values >= prob_theshold),
+            StrategyEnum.SellPut,
             np.where(
-                (previous_tech_signal == StrategyEnum.SellIronCondor) &
-                (tech_signal == StrategyEnum.Hold) &
-                (df["call_p"].values >= prob_theshold) &
-                (df["put_p"].values >= prob_theshold),
-                StrategyEnum.SellIronCondor,
-                StrategyEnum.Hold
+                (previous_tech_signal == StrategyEnum.SellCall) &
+                (tech_signal == StrategyEnum.SellCall) &
+                (df["call_p"].values >= prob_theshold), 
+                StrategyEnum.SellCall,
+                np.where(
+                    (previous_tech_signal == StrategyEnum.SellIronCondor) &
+                    (tech_signal == StrategyEnum.SellIronCondor) &
+                    (df["call_p"].values >= prob_theshold) &
+                    (df["put_p"].values >= prob_theshold),
+                    StrategyEnum.SellIronCondor,
+                    StrategyEnum.Hold
+                )
             )
         )
-    )
-    df["final_signal"] = final_signal
+        df["final_signal"] = final_signal
+    except Exception as e:
+        print("Error combining signals: ", e)
+        df["final_signal"] = StrategyEnum.Hold
     return df
 
 # 12. Adjust strikes based on previous values
@@ -455,12 +783,18 @@ def adjust_strikes(df, symbol = None):
 
 def adjust_high(x, m = 5):
     try:
+        # if nan just return x
+        if pd.isna(x):
+            return x
         return math.ceil(x / m) * m
     except Exception:
         return x
 
 def adjust_low(x, m = 5):
     try:
+        # if nan just return x
+        if pd.isna(x):
+            return x
         return math.floor(x / m) * m
     except Exception:
         return x

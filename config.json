@@ -1,0 +1,236 @@
+{
+    "optionalpha": "https://app.optionalpha.com/zdte/backtester/compare/ZT41749208566099529207,ZT3174939040939454623,ZT6174920812210117393",
+    "symbols": {
+
+        "QQQ": [
+            {
+                "id": "checkFixedDistanceIronCondor_QQQ",
+                "function": "checkFixedDistanceIronCondor",
+                "day_of_week": "mon-fri",
+                "hour": 14,
+                "minute": "30-35",
+                "second": "0/30",
+                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT41749208566099529207",
+                "kwargs": {
+                    "distance": 0.01,
+                    "wingspan": 4
+                }
+            },
+            {
+                "id": "shutdownOrb_QQQ",
+                "function": "shutdown",
+                "day_of_week": "mon-fri",
+                "hour": 14,
+                "minute": "45",
+                "display": false
+            }
+        ],
+        "IWM": [
+            {
+                "id": "checkDeltaIronCondor_IWM",
+                "function": "checkDeltaIronCondor",
+                "terminalTitle": true,
+
+                "day_of_week": "mon-fri",
+                "hour": 13,
+                "minute": "57-59",
+                "second": "0/30",
+                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT6174920812210117393",
+
+                "kwargs": {
+                    "short_delta": 0.4,
+                    "long_delta": 0.1
+                }
+                
+            },
+            {
+                "id": "checkWheel_IWM",
+                "function": "checkWheelTrade",
+                "terminalTitle": false,
+
+                
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "9",
+                        "minute": "35-59",
+                        "second": "0/30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "10-13",
+                        "minute": "*",
+                        "second": "0/30"
+                    }
+                    
+                ]
+            },
+            {
+                "id": "shutdown_IWM",
+                "function": "shutdown",
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "10",
+                        "minute": "16",
+                        "second": "30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": 14,
+                        "minute": "02"
+                    }
+                ],
+
+                "display": false
+            }
+        ],
+        "SPY": [
+            {
+                "id": "checkFixedDistanceIronCondor_SPY",
+                "function": "checkFixedDistanceIronCondor",
+                "day_of_week": "mon-fri",
+                "terminalTitle": true,
+                "hour": 15,
+                "minute": "0-5",
+                "second": "0/30",
+                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT3174939040939454623",
+
+                "kwargs": {
+                    "distance": 0.01,
+                    "wingspan": 3,
+                    "tp": 20,
+                    "sl": 200,
+                    "touchDistance": 3
+                    
+                }
+            },
+            {
+                "id": "shutdownOrb_SPY",
+                "function": "shutdown",
+                "day_of_week": "mon-fri",
+                "hour": 15,
+                "minute": "6",
+                "second": "30",
+                "display": false
+            }
+            
+        ],
+        "SPY_": [
+
+            {
+                "id": "checkLongOrbByDelta_SPY",
+                "function": "checkLongOrbByDelta",
+                "backtest": "https://app.optionalpha.com/zdte/backtester/compare/ZT3175077663549764120,ZT3175077658166309319?crules=%7B%22posLimit%22%3A2%2C%22posLimitDay%22%3A2%2C%22rules%22%3A%5B%5D%7D&combine=1",
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "9",
+                        "minute": "45-59",
+                        "second": "0"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "10-14",
+                        "minute": "*",
+                        "second": "0"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "15",
+                        "minute": "0-55",
+                        "second": "0"
+                    }
+
+
+                ],
+                "kwargs": {
+                    "orb": 15,
+                    "tp": 125,
+                    "sl": 75,
+                    "delta": 0.4
+                }
+            },
+            {
+                "id": "shutdownOrb_SPY",
+                "function": "shutdown",
+                "day_of_week": "mon-fri",
+                "hour": 16,
+                "minute": "5",
+                "display": false
+            }
+        ],
+        "SPX": [
+            {
+                "id": "checkFixedDistanceIronCondor_SPX",
+                "function": "checkSeparatedIronCondor",
+                "day_of_week": "mon-fri",
+                "hour": 14,
+                "minute": "36-40",
+                "second": "0/30",
+                "terminalTitle": true,
+                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT21749736019710462132",
+
+                "kwargs": {
+                    "callDistance": 0.5,
+                    "putDistance": -0.5,
+                    "wingspan": 15,
+                    "tp": 80,
+                    "sl": 170,
+                    "touchDistance": 25
+                }
+            },
+            {
+                "id": "shutdownOrb_SPX",
+                "function": "shutdown",
+                "day_of_week": "mon-fri",
+                "hour": 14,
+                "minute": "45",
+                "display": false
+            }
+        ],
+        "XSP": [
+            {
+                "id": "checkOrbCreditSpread_XSP",
+                "function": "checkOrbCreditSpread",
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "10",
+                        "minute": "29-59",
+                        "second": "0/30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "11-12",
+                        "minute": "*",
+                        "second": "0/30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "13",
+                        "minute": "0-30",
+                        "second": "0/30"
+                    }
+                ],
+                "terminalTitle": true,
+                "backtest": "https://app.optionalpha.com/zdte/backtester/compare/ZT517506819071895783,ZT517506832295641975?crules=%7B%22posLimit%22%3A2%2C%22posLimitDay%22%3A2%2C%22rules%22%3A%5B%5D%7D&combine=1",
+                "kwargs": {
+                    "orb": 60,                    
+                    "wingspan": 2,
+                    "max_orb_age": 45
+
+                }
+            },
+            {
+                "id": "shutdownOrb_XSP",
+                "function": "shutdown",
+                "day_of_week": "mon-fri",
+                "hour": 13,
+                "minute": "32",
+                "second": "30",
+                "display": false
+            }
+        ]
+    }
+}

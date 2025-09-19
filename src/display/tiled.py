@@ -20,7 +20,7 @@ pd.options.display.float_format = '{:.2f}'.format
 def initialize_curses(screen):
     curses.curs_set(0)
     screen.nodelay(True)
-    screen.timeout(500)
+    screen.timeout(2500)
     # Turn off automatic echoing of keys to the screen
     curses.noecho()
     # React to keys instantly, without requiring the Enter key
@@ -66,7 +66,7 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
     initialize_curses(screen)
     symbol, secType, exchange = focusSymbol
     # get the offsets from the config
-    callDistance, putDistance, wing_span, target_premium, ic_wingspan, tp_percentage, sl = app.get_offset_configs(symbol)
+    callDistance, putDistance, wing_span, target_premium, ic_wingspan, tp_percentage, sl, call_delta, put_delta = app.get_offset_configs(symbol)
     
 
     # schedule.every(150).seconds.do(catch_up, app, historyAdapter, orderAdapter, focusSymbol)    
@@ -249,7 +249,7 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
 
             if key == ord('V'):
                 display_data = not display_data
-
+            """
             if key == ord('P'):
                 app.addToActionLog("P key pressed")
                 legs = app.build_credit_spread(symbol, 0.15, "P", wing_span)
@@ -264,7 +264,6 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
                 app.addToActionLog("i key pressed")
                 legs = app.construct_from_underlying(symbol, ic_wingspan, ic_wingspan)
                 orderAdapter.place_combo_order(legs, tp_percentage, None, "IronCondor")
-
             if key == ord("E"):
                 app.addToActionLog("E key pressen")
                 legs: dict = app.evTrader.find_best_ev_credit_spreads(symbol, 10,1-(20/100))
@@ -294,6 +293,7 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
                 credit_by_premium("C")
             if key == ord('4'):
                 credit_by_premium("P")
+            """
 
             
             if key == curses.KEY_UP:

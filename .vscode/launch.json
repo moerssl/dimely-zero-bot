@@ -40,6 +40,46 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${cwd}/src/meic.py",
+            
+            "console": "externalTerminal"
+        },
+        {
+            "name": "IWM",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/fromConfig.py",
+            "args": ["IWM"],
+            "console": "externalTerminal"
+        },
+        {
+            "name": "SPY",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/fromConfig.py",
+            "args": ["SPY"],
+            "console": "externalTerminal"
+        },
+        {
+            "name": "XSP",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/fromConfig.py",
+            "args": ["XSP"],
+            "console": "externalTerminal"
+        },
+        {
+            "name": "SPX",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/fromConfig.py",
+            "args": ["SPX"],
+            "console": "externalTerminal"
+        },
+        {
+            "name": "QQQ",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/qqq.py",
             "console": "externalTerminal"
         },
         {
@@ -47,6 +87,13 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${cwd}/src/trainlarge.py",
+            "console": "externalTerminal"
+        },
+        {
+            "name": "Lagger",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/src/lagger.py",
             "console": "externalTerminal"
         }
     ]

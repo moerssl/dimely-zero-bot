@@ -9,9 +9,9 @@ import pandas as pd
 from ib.IBApp import IBApp
 import threading
 
-def start_dash_app(app: IBApp, orderApp):
+def start_dash_app(app: IBApp, orderApp, optionsApp, port=8050):
     dash_app = Dash(__name__)
-    flaskApi = Api(dash_app.server, app, orderApp, "candle-config.txt")
+    flaskApi = Api(dash_app.server, app, orderApp, optionsApp, "candle-config.txt")
 
     render_lock = threading.Lock()  # Add this line
 
@@ -304,4 +304,4 @@ def start_dash_app(app: IBApp, orderApp):
         # If something goes wrong or no valid trace is drawn, return an empty figure.
         return fig
 
-    threading.Thread(target=lambda: dash_app.run_server(debug=False, use_reloader=False), daemon=True).start()
+    threading.Thread(target=lambda: dash_app.run(debug=False, use_reloader=False, port=port), daemon=True).start()

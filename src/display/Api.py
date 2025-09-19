@@ -11,9 +11,10 @@ class Api:
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         return response
     
-    def __init__(self, server: Flask, app, orderApp, config_file: str):
+    def __init__(self, server: Flask, app, orderApp, optionsApp, config_file: str):
         self.server = server
         self.app = app
+        self.optionsApp = optionsApp
         self.config_file = config_file
 
         # allow corss for all routes
@@ -26,8 +27,8 @@ class Api:
             """Endpoint to fetch all data."""
             chart_data: pd.DataFrame = self.app.get_chart_data(mergePredictions=True)
             if isinstance(chart_data, pd.DataFrame):
-                chart_data = chart_data.iloc[::-1]
-                return chart_data.to_html(index=False)
+                chart_data = chart_data
+                return self.toJsonOrHtml(chart_data)
             
             
         @self.server.route("/api/candle", methods=["GET"])
@@ -61,19 +62,20 @@ class Api:
             
         @self.server.route("/api/options", methods=["GET"])
         def getOptions():
-            data: pd.DataFrame = self.app.options_data
+            data: pd.DataFrame = self.optionsApp.options_data
             if isinstance(data, pd.DataFrame):
                 # Calculate otm distance for non-NaN undPrice for call (C) and put (P)
                 data["otm"] = float('-inf')
                 data.loc[(data["Type"] == "P") & (data["undPrice"].notna()), "otm"] = data["undPrice"] - data["Strike"]
                 data.loc[(data["Type"] == "C") & (data["undPrice"].notna()), "otm"] = data["Strike"] - data["undPrice"]
+                
 
                 # Sort non-NaN undPrice by otm ascending, NaN undPrice last
                 sorted_data = data[data["otm"] > -5].sort_values(by=["otm"], ascending=True, na_position='last')
                 if (len(sorted_data) > 0):
-                    return sorted_data.to_html(index=False)
+                    return self.toJsonOrHtml(sorted_data)
                 else:
-                    return data.to_html(index=False)
+                    return self.toJsonOrHtml(data)
             else:
                 return jsonify({"error": "No data available"}), 400
 
@@ -81,6 +83,7 @@ class Api:
         def getPositions():
             """Endpoint to fetch positions."""
             data = orderApp.positions
+            
             df = pd.DataFrame(data.values())
             return df.to_html(index=False)
 

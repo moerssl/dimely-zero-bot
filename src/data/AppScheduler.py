@@ -15,7 +15,7 @@ import pandas as pd
 import logging
 
 # Get the APScheduler logger
-logging.getLogger('apscheduler').setLevel(logging.DEBUG)
+# logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 
 
 class AppScheduler:
@@ -33,7 +33,7 @@ class AppScheduler:
         # Define New York timezone for the triggers.
         self.ny_tz = pytz.timezone("America/New_York")
 
-        self.callDistance, self.putDistance, self.wing_span, self.target_premium, self.ic_wingspan, self.tp_percentage, self.sl_percentag = app.get_offset_configs(symbol)
+        self.callDistance, self.putDistance, self.wing_span, self.target_premium, self.ic_wingspan, self.tp_percentage, self.sl_percentag, self.call_delta, self.put_delta = app.get_offset_configs(symbol)
 
         self.warmUpThreshold = timedelta(minutes=1)
         self.startTime = datetime.now()
@@ -91,7 +91,7 @@ class AppScheduler:
         delta_first_run = inTzTime(9,45)
         delta_last_run = inTzTime(15,15)
         delta_trade_trigger = CronTrigger(minute="*", hour="9-15", second="10", timezone=self.ny_tz, start_date=delta_first_run, end_date=delta_last_run)
-        self.scheduler.add_job(func=self.checkDeltaTrade, trigger=delta_trade_trigger, id="checkDeltaTrade")
+        #self.scheduler.add_job(func=self.checkDeltaTrade, trigger=delta_trade_trigger, id="checkDeltaTrade")
         
         catch_up_trigger = CronTrigger(second=30, minute="*", hour="9-16", timezone=self.ny_tz, start_date=delta_first_run)
         self.scheduler.add_job(func=self.catch_up, trigger=catch_up_trigger, id="catch_up")
@@ -228,24 +228,24 @@ class AppScheduler:
                 
                 callStrike = technicalAnalysis.get("call")
                 putStrike = technicalAnalysis.get("put")
-                minPrice = self.minPrice
+                minPrice = self.wing_span * 0.05
                 
                 # callLegs = self.app.find_credit_spread_legs(symbol, callStrike, "C", self.callDistance)
                 # putLegs = self.app.find_credit_spread_legs(symbol, putStrike, "P", self.putDistance)
-                callLegs = self.app.build_credit_spread(self.symbol, 0.16, "C", self.wing_span, minPrice)
-                putLegs = self.app.build_credit_spread(self.symbol, 0.16, "P", self.wing_span, minPrice)
+                callLegs = self.app.build_credit_spread(self.symbol, self.call_delta, "C", self.wing_span, minPrice)
+                putLegs = self.app.build_credit_spread(self.symbol, self.put_delta, "P", self.wing_span, minPrice)
 
 
                 callPrice = TwsOrderAdapter.calcSpreadPrice(callLegs)
                 putPrice = TwsOrderAdapter.calcSpreadPrice(putLegs)
 
-                if signal == StrategyEnum.SellCall and not self.orderApp.has_existing_order_contracts(callLegs) and abs(callPrice) >= self.minPrice:
+                if signal == StrategyEnum.SellCall and  self.orderApp.is_room_for_new_positions(self.symbol, "C") and abs(callPrice) >= self.minPrice:
                     self.app.addToActionLog("Ordering TA Call Credit Spread")
-                    self.orderApp.place_combo_order(callLegs, self.tp_percentage, None, "TACallCredit")
+                    self.orderApp.place_combo_order(callLegs, self.tp_percentage, self.sl_percentag, "TACallCredit")
                     sleep(0.5)
-                elif signal == StrategyEnum.SellPut and not self.orderApp.has_existing_order_contracts(putLegs) and abs(putPrice) >= self.minPrice:    
+                elif signal == StrategyEnum.SellPut and  self.orderApp.is_room_for_new_positions(self.symbol, "P") and abs(putPrice) >= self.minPrice:    
                     self.app.addToActionLog("Ordering TA Put Credit Spread")
-                    self.orderApp.place_combo_order(putLegs, self.tp_percentage, None, "TAPutCredit")
+                    self.orderApp.place_combo_order(putLegs, self.tp_percentage, self.sl_percentag, "TAPutCredit")
                     sleep(0.5)
         except Exception as e:
             self.app.addToActionLog("Error in checkTechnicalEntry: " + str(e))

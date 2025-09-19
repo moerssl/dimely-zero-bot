@@ -9,8 +9,14 @@
       <tbody>
         <tr v-for="(orderItem, rowIndex) in orders" :key="rowIndex">
           <td v-for="col in columns" :key="col">
-            <span v-if="!isObject(orderItem[col])">{{ orderItem[col] }}</span>
-            <span v-else>{{ stringify(orderItem[col]) }}</span>
+            <template v-if="col == 'time'">
+                {{ formatDate(orderItem[col]) }}
+            </template>
+            <template v-else>
+              <span v-if="!isObject(orderItem[col])">{{ orderItem[col] }}</span>
+              <span v-else>{{ stringify(orderItem[col]) }}</span>
+            </template>
+
           </td>
         </tr>
       </tbody>
@@ -30,6 +36,17 @@ const columns = computed(() => {
   if (!props.orders || props.orders.length === 0) return [];
   return Object.keys(props.orders[0]);
 });
+
+function formatDate(val) {
+  const now = new Date(val)
+
+  // Get date string in YYYY-MM-DD format
+  const dateStr = now.toISOString().split('T')[0];
+
+  // Get time string in HH:MM:SS format
+  const timeStr = now.toTimeString().split(' ')[0];
+  return timeStr
+}
 
 // Helper to check for objects
 function isObject(val) {

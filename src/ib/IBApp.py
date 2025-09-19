@@ -1,6 +1,7 @@
 import os
 from typing import List, Tuple
 import numpy as np
+from data.OrbResult import OrbResult
 from ib.IBWrapper import IBWrapper
 from ib.IbQueueWrapper import IbQueueWrapper
 from ib.IBClient import IBClient
@@ -25,9 +26,11 @@ import talib
 import scipy.stats as stats
 from scipy.stats import norm
 from util.Chart import Chart
+from util.Logger import Logger
 from util.StrategyEnum import StrategyEnum
 from util.AdaptiveDataframeProcessor import AdaptiveDataframeProcessor
 import util.TaAnalysisHelper as tah
+from util.TelegramMessenger import send_telegram_message
 from util.config import CONFIG
 from ib.TwsOrderAdapter import TwsOrderAdapter
 from data.ExpectedValueTrader import ExpectedValueTrader
@@ -76,6 +79,7 @@ class IBApp(IBWrapper, IBClient):
         self.candleSize = candleSize
         self.mergePredictThread = None
         self.chartData = None
+        self.useStandardTiles = True
 
         self.marketDataPrefix = [
             ("TRADES", "", True),
@@ -87,6 +91,10 @@ class IBApp(IBWrapper, IBClient):
         self.evTrader = ExpectedValueTrader(self.options_data, self.addToActionLog)
         self.additionalTilesFuncs = []
         self.underlyingSymbols = None
+        self.optionUnderlyings = None
+
+        self.focusContract = None
+        
 
         """
         self.loadCandle()
@@ -94,12 +102,26 @@ class IBApp(IBWrapper, IBClient):
         if (distance is not None and distance < 86000):
             self.lookBackTime = str(int(distance)) + " S"
         """
+    def get_orb_config(self, symbol):
+        """
+        Returns the ORB configuration for a given symbol.
+        If the symbol is not found in the configuration, it returns the default ORB length.
+        """
+        try:
+            if symbol in CONFIG["offsets"]:
+                return CONFIG["offsets"][symbol].get("orbLength", CONFIG["default_orb_length"])
+            else:
+                return CONFIG["default_orb_length"]
+        except Exception as e:
+            print(f"Error getting ORB config for {symbol}: {e}")
+            return CONFIG["default_orb_length"]
+    
     def get_offset_configs(self, symbol):
         try:
             if symbol in CONFIG["offsets"]:
-                return CONFIG["offsets"][symbol]["call"], CONFIG["offsets"][symbol]["put"], CONFIG["offsets"][symbol]["wing_span"], CONFIG["offsets"][symbol]["target_premium"], CONFIG["offsets"][symbol]["late_ic_windspan"], CONFIG["tpFromLimit"], CONFIG["slFromLimit"]
+                return CONFIG["offsets"][symbol]["call"], CONFIG["offsets"][symbol]["put"], CONFIG["offsets"][symbol]["wing_span"], CONFIG["offsets"][symbol]["target_premium"], CONFIG["offsets"][symbol]["late_ic_windspan"], CONFIG["tpFromLimit"], CONFIG["slFromLimit"],CONFIG["offsets"][symbol]["call_delta"], CONFIG["offsets"][symbol]["put_delta"]
             else:
-                return CONFIG["default_strike_offset_call"], CONFIG["default_strike_offset_put"], CONFIG["default_wing_span"], CONFIG["default_target_premium"], CONFIG["default_late_ic_windspan"], CONFIG["tpFromLimit"], CONFIG["slFromLimit"]
+                return CONFIG["default_strike_offset_call"], CONFIG["default_strike_offset_put"], CONFIG["default_wing_span"], CONFIG["default_target_premium"], CONFIG["default_late_ic_windspan"], CONFIG["tpFromLimit"], CONFIG["slFromLimit"],CONFIG["call_delta"], CONFIG["put_delta"]
         except Exception as e:
             print(f"Error getting offset configs for {symbol}: {e}")
             return None, None, None, None, None    
@@ -170,6 +192,7 @@ class IBApp(IBWrapper, IBClient):
             contract.exchange = ex
 
             req = self.nextReqId()
+            Logger.log("Requesting "+ symbol)
             self.market_data_req_ids[req] = { "symbol": symbol }
             self.reqMktData(req, contract, "", False, False, [])
             time.sleep(0.1)  # To avoid pacing violations
@@ -179,12 +202,14 @@ class IBApp(IBWrapper, IBClient):
         try:
             keys = [*self.market_data_req_ids.keys()]
             for req in keys:
+                # Logger.log("Canceling reqId "+ str(req))
                 self.cancelMktData(req)
-                if req in self.option_id_req.values():
+                if req in self.option_id_req.values() and req in self.market_data_req_ids:
                     del self.market_data_req_ids[req]
             self.option_id_req.clear()
         except Exception as e:
             self.addToActionLog("Error canceling all market data: " + str(e))
+            Logger.log("Error canceling all market data: " + str(e))
 
     def cancel_options_market_data(self,options_data):
         try:
@@ -201,11 +226,28 @@ class IBApp(IBWrapper, IBClient):
                 return
             
             self.cancelMktData(req)
+            
             del self.market_data_req_ids[req]
         except Exception as e:
             self.addToActionLog("Error canceling market data: " + str(e))
 
-    
+    def request_all_options_data(self):
+        try:
+            symbol, _, _ = self.focusContract
+            info = self.checkUnderlyingOptions(symbol)
+            price = info.get("price")
+
+            if (price):
+                for _, contract in self.options_data.iterrows():
+                    # Logger.logText(contract["Symbol"]+" "+str(contract["Strike"])+" "+str(contract["Type"]))
+                    if (contract["Symbol"] == symbol):
+                        strikeDistance = abs(contract["Strike"] - price) / price * 100
+
+                        if strikeDistance <= 1:
+                            self.request_options_market_data(contract)
+        except Exception as e:
+            Logger.log(str(e))
+        
     def request_options_market_data(self,options_data):
         if (options_data is None):
             return
@@ -216,6 +258,13 @@ class IBApp(IBWrapper, IBClient):
             if (utcnow - time_value).total_seconds() > 60:
                 self.cancel_options_market_data(options_data)
                 time.sleep(0.1)  # To avoid pacing violations
+
+                # Locate the correct row by ConId and update the columns
+                con_id = options_data["ConId"]
+                if con_id is not None:
+                    row_mask = self.options_data["ConId"] == con_id
+                    self.options_data.loc[row_mask, ["delta", "bid", "ask", "undPrice"]] = None
+
 
         if (options_data["ConId"] in self.option_id_req):
             # print("options ID already subscribed data available", options_data["ConId"])
@@ -240,8 +289,15 @@ class IBApp(IBWrapper, IBClient):
 
     def fetch_options_data(self, symbols, date: datetime = datetime.today()):
         self.lastRequestedDateForContracts = date
+        if self.optionUnderlyings is None:
+            self.optionUnderlyings = symbols
+
         for i, symbol_type in enumerate(symbols):
             symbol, type,ex = symbol_type
+            try:
+                send_telegram_message(f"Fetching options for {symbol} {date.strftime('%Y-%m-%d')}")
+            except Exception as e:
+                self.addToActionLog("Error sending telegram message: " + str(e))
 
             for right in ["C", "P"]:
                 req = self.nextReqId()
@@ -332,61 +388,188 @@ class IBApp(IBWrapper, IBClient):
 
         return self.find_iron_condor_legs(puts, calls, current_price,distance, wingspan)
 
+    def forDisplay(rows, include_key=False):
+        """
+        This function takes a dictionary where each entry is a dataframe row
+        and returns a pandas DataFrame. Optionally, it can add the row keys as the first column.
+
+        Parameters:
+        rows (dict): A dictionary where keys are row names and values are dictionaries representing rows.
+        include_key (bool): If True, adds the dictionary keys as the first column in the DataFrame.
+
+        Returns:
+        pd.DataFrame: A pandas DataFrame created from the input dictionary.
+        """
+
+        if rows is None or not hasattr(rows, "items"):
+            return rows or pd.DataFrame()
+
+        # Filter out None values
+        filtered_rows = {key: value for key, value in rows.items() if value is not None}
+
+        # Converting dictionary of rows to a DataFrame
+        if filtered_rows:
+            df = pd.DataFrame.from_dict(filtered_rows, orient='index')
+
+            if include_key:
+                df.insert(0, "Key", df.index)
+
+            return df
+        else:
+            return pd.DataFrame()
+
+
+    def defineSpreadTile(title, spread, colspan=None, tpAtLmt = 1):
+        tp = 1 - tpAtLmt
+        price = TwsOrderAdapter.calcSpreadPrice(spread)
+        risk = TwsOrderAdapter.calcMaxRisk(spread, price)
+        ev, evs = "N/A", "N/A"
+        if (price is not None and price <= -0.2):
+            ev = ExpectedValueTrader.calcExpectedValue(spread, tp)
+            evs = ExpectedValueTrader.calcExpectedValue(spread, tp, simple=True)
+        if price is not None and not math.isnan(price):
+            price = round(price, 2)
+        content = IBApp.forDisplay(spread, True)
+        title = title + " | lmt: " + str(price) + " | r: " +str(risk) + " | EV:" + str(ev)+ " | EVs:" + str(evs)
+
+        ret = {
+            "title": title,
+            "content": content
+        }
+
+        if (colspan):
+            ret["colspan"] = colspan
+
+        return ret
+    
+    def find_orb_by_symbol(self, symbol, length=30) -> OrbResult:
+        """
+        Find the Opening Range Breakout (ORB) for a given symbol.
+        
+        :param symbol: The symbol for which to find the ORB.
+        :param length: The length of the ORB period in minutes.
+        :return: A dictionary containing ORB details or None if not applicable.
+        """
+        if symbol not in self.candleData:
+            return None
+
+        dataframe = self.candleData[symbol]
+        return self.find_orb(dataframe, length)
+    
+    def find_orb(self, df, length=30) -> OrbResult:
+        orb = OrbResult()
+        required = {'datetime','open','high','low','close'}
+        if not required.issubset(df.columns):
+            return orb
+
+        # clean & cast
+        df = df.dropna(subset=['datetime']).copy()
+        if df.empty:
+            return orb
+        df['datetime'] = pd.to_datetime(df['datetime'])
+
+        # focus on today’s data
+        latest = df['datetime'].dt.date.max()
+        orb.date = latest
+        today = df[df['datetime'].dt.date == latest]
+        if today.empty:
+            return orb
+
+        # define open‐range window
+        start_time = today['datetime'].min()
+        end_time   = start_time + pd.Timedelta(minutes=length)
+
+        # open‐range candles
+        orb_window = today[
+            (today['datetime'] >= start_time) &
+            (today['datetime'] <  end_time)
+        ]
+        if orb_window.empty:
+            return orb
+
+        # record OR stats
+        orb.open  = orb_window.iloc[0]['open']
+        orb.high  = orb_window['high'].max()
+        orb.low   = orb_window['low'].min()
+        orb.close = orb_window.iloc[-1]['close']
+
+        # has OR period actually completed?
+        # i.e. do we have any candle whose timestamp ≥ end_time?
+        last_timestamp = today['datetime'].max()
+        orb.isOpenRangeCompleted = last_timestamp >= end_time
+
+        # get all bars after OR window
+        post = today[today['datetime'] >= end_time].copy()
+        if post.empty:
+            # no post-OR data yet
+            return orb
+
+        # build inside‐range mask
+        post['is_inside'] = (
+            (post['close'] >= orb.low) &
+            (post['close'] <= orb.high)
+        )
+        # detect first bar stepping outside (from inside → outside)
+        post['left_range'] = (
+            (~post['is_inside']) &
+            (post['is_inside'].shift(fill_value=True))
+        )
+        # timestamps of each breakout
+        breakout_times = post.loc[post['left_range'], 'datetime']
+        orb.breakout_count = len(breakout_times)
+
+        # last bar in post-OR series
+        if len(post) >= 2:
+            last = post.iloc[-2]
+            orb.current = last['close']
+            orb.isAbove = last['close'] > orb.high
+            orb.isBelow = last['close'] < orb.low
+
+            # only compute breakout_age if 1) a breakout occurred 2) price still outside
+            if orb.breakout_count > 0 and (orb.isAbove or orb.isBelow):
+                last_bo = breakout_times.iloc[-1]
+                orb.breakout_age = int(
+                    (last['datetime'] - last_bo).total_seconds()//60
+                )
+        # else orb.breakout_age remains −1
+
+        return orb
+
 
     def getTilesData(self, symbol):
-        def forDisplay(rows):
-            """
-            This function takes a dictionary where each entry is a dataframe row
-            and returns a pandas DataFrame.
-
-            Parameters:
-            rows (dict): A dictionary where keys are row names and values are dictionaries representing rows.
-
-            Returns:
-            pd.DataFrame: A pandas DataFrame created from the input dictionary.
-            """
-
-            if (rows is None or not hasattr(rows, "items")):
-                return pd.DataFrame()
-            
-            # Filter out None values
-            filtered_rows = {key: value for key, value in rows.items() if value is not None}
-
-            # Converting dictionary of rows to a DataFrame
-            if filtered_rows:
-                df = pd.DataFrame.from_dict(filtered_rows, orient='index')
-                return df
-            else:
-                
-                return  pd.DataFrame()
         
-        def defineSpreadTile(title, spread, colspan=None, tpAtLmt = 1):
-            tp = 1 - tpAtLmt
-            price = TwsOrderAdapter.calcSpreadPrice(spread)
-            risk = TwsOrderAdapter.calcMaxRisk(spread, price)
-            ev, evs = "N/A", "N/A"
-            if (price is not None and price <= -0.2):
-                ev = ExpectedValueTrader.calcExpectedValue(spread, tp)
-                evs = ExpectedValueTrader.calcExpectedValue(spread, tp, simple=True)
-            if price is not None and not math.isnan(price):
-                price = round(price, 2)
-            content = forDisplay(spread)
-            title = title + " | lmt: " + str(price) + " | r: " +str(risk) + " | EV:" + str(ev)+ " | EVs:" + str(evs)
-
-            ret = {
-                "title": title,
-                "content": content
-            }
-
-            if (colspan):
-                ret["colspan"] = colspan
-
-            return ret
-        
-        callDistance, putDistance, wing_span, target_premium, ic_wingspan, tp, sl = self.get_offset_configs(symbol)
+        callDistance, putDistance, wing_span, target_premium, ic_wingspan, tp, sl, call_delta, put_delta = self.get_offset_configs(symbol)
 
         tp = tp / 100 
         sl = sl / 100
+
+        spreadTiles = []
+        if (self.useStandardTiles):
+            spreadTiles = [
+                IBApp.defineSpreadTile(symbol + " " + str(call_delta) + " Delta Bear Call (C)", self.build_credit_spread(symbol, call_delta, "C", wing_span), 2, tp),
+                IBApp.defineSpreadTile(symbol + " " + str(put_delta) + " Delta Bull Put (P)",  self.build_credit_spread(symbol, put_delta, "P", wing_span), 2, tp),
+                IBApp.defineSpreadTile(symbol + " " +  "40/10 Delta Bull Put (C)",  self.build_credit_spread_by_delta(symbol, 0.4, 0.1, "C"), 2, tp),
+                IBApp.defineSpreadTile(symbol + " " +  "40/10 Delta Bull Put (P)",  self.build_credit_spread_by_delta(symbol, 0.4, 0.1, "P"), 2, tp),
+                #defineSpreadTile(symbol + " " + str(target_premium) +"$ Bear Call (3)", self.build_credit_spread_by_premium(symbol, target_premium, "C", wing_span * 2), 2, tp),
+                #defineSpreadTile(symbol + " " + str(target_premium) +"$ Bull Put (4)",  self.build_credit_spread_by_premium(symbol, target_premium, "P", wing_span * 2), 2, tp),
+                #defineSpreadTile("SPX IC Trades (I)", self.construct_from_underlying(symbol, ic_wingspan, ic_wingspan), 2, tp),
+                
+                #defineSpreadTile("QQQ IC 3pm", self.construct_from_underlying("QQQ", 0.5, 5),2),
+            
+                IBApp.defineSpreadTile(symbol + " " + str(callDistance) +"/"+ str(wing_span) +" Bear Call (1)", self.build_credit_spread_dollar(symbol, callDistance, wing_span, "C"), 2, tp),
+                IBApp.defineSpreadTile(symbol + " " + str(putDistance) +"/"+ str(wing_span) +"  Bull Put (2)",  self.build_credit_spread_dollar(symbol, putDistance, wing_span, "P"), 2, tp),
+                IBApp.defineSpreadTile("Best EV", self.evTrader.find_best_ev_credit_spreads(symbol, 10,0.8),2,tp)
+            ]
+
+        orbLength = self.get_orb_config(symbol)
+        orb: OrbResult = self.find_orb_by_symbol(symbol, orbLength)
+
+        orbDisplay = None
+        orbTitle = "ORB"+str(orbLength)
+        if orb is not None:
+            orbDisplay = IBApp.forDisplay(orb.__dict__, True)
+            orbTitle = orbTitle+ "("+ str(orb.breakout_count) +") | h:" + str(orb.high) + " | l:" + str(orb.low) + " | c:" + str(orb.current) + " | o:" + str(orb.open) + " | age:" + str(orb.breakout_age) + " | width: " + str(round(orb.range_width_pct,2)) + "%"
+
         try:
             return [
                 {
@@ -403,22 +586,16 @@ class IBApp(IBWrapper, IBClient):
                 },
                 {
                     "title": "Action Log",
-                    "content": forDisplay(pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame()),
+                    "content": IBApp.forDisplay(pd.DataFrame(self.actionLog).sort_values(by=0, ascending=False)[1] if len(self.actionLog) > 0 else pd.DataFrame()),
                     "colspan": 1
                 },
-                defineSpreadTile("SPX 15 Delta Bear Call (C)", self.build_credit_spread(symbol, 0.16, "C", wing_span, 0.2), 2, tp),
-                defineSpreadTile("SPX 15 Delta Bull Put (P)",  self.build_credit_spread(symbol, 0.16, "P", wing_span, 0.2), 2, tp),
-                defineSpreadTile("SPX "+ str(target_premium) +"$ Bear Call (3)", self.build_credit_spread_by_premium(symbol, target_premium, "C", wing_span * 2), 2, tp),
-                defineSpreadTile("SPX "+ str(target_premium) +"$ Bull Put (4)",  self.build_credit_spread_by_premium(symbol, target_premium, "P", wing_span * 2), 2, tp),
-                #defineSpreadTile("SPX IC Trades (I)", self.construct_from_underlying(symbol, ic_wingspan, ic_wingspan), 2, tp),
-                
-                #defineSpreadTile("QQQ IC 3pm", self.construct_from_underlying("QQQ", 0.5, 5),2),
-            
-                defineSpreadTile("SPX "+ str(callDistance) +"/"+ str(wing_span) +" Bear Call (1)", self.build_credit_spread_dollar(symbol, callDistance, wing_span, "C"), 2, tp),
-                defineSpreadTile("SPX "+ str(putDistance) +"/"+ str(wing_span) +"  Bull Put (2)",  self.build_credit_spread_dollar(symbol, putDistance, wing_span, "P"), 2, tp),
-                defineSpreadTile("Best EV", self.evTrader.find_best_ev_credit_spreads(symbol, 10,0.8),2,tp),
+                *spreadTiles,
                 {
-                    "title": "SPX Stats",
+                    "title": orbTitle,
+                    "content":  orbDisplay if orbDisplay is not None else pd.DataFrame(),
+                },
+                {
+                    "title": symbol + " Stats",
                     "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame())),
                     "colspan": 2
                 },
@@ -484,11 +661,19 @@ class IBApp(IBWrapper, IBClient):
                 })
               elif isinstance(func, dict):  # If it's a dictionary with predefined attributes
                 result = func.get("function")()
-                tiles.append({
-                    "title": func.get("title", "Untitled"),
-                    "content": result,
-                    "colspan": func.get("colspan", 1),  # Default colspan to 1 if not provided
-                })
+
+                
+                # check if result is a dict with at least key content
+                if result is not None and isinstance(result, dict) and "content" in result:
+                    result["title"] = func.get("title", "Untitled") + result.get("title")
+                    tiles.append(result)
+                else:
+
+                    tiles.append({
+                        "title": func.get("title", "Untitled"),
+                        "content": result,
+                        "colspan": func.get("colspan", 1),  # Default colspan to 1 if not provided
+                    })
             except Exception as e:
                 self.addToActionLog(f"Error in additional tile function: {str(e)}")
         return tiles
@@ -706,16 +891,31 @@ class IBApp(IBWrapper, IBClient):
             if requestDate is not None and requestDate == self.lastRequestedDateForContracts:
                 plusOneDay = requestDate + timedelta(days=1)
                 self.fetch_options_data(symbols, plusOneDay)
+                time.sleep(0.1)  # To avoid pacing violations
 
         if errorCode not in [2104, 2106,2158]:
             print("Error. Id: ", reqId, "Time: ", errorTime, " Code: ", errorCode, " Msg: ", errorString)
             self.addToActionLog(" Msg: " + str(errorString) + " Code: " + str(errorCode) + " Id: " + str(reqId))
+
+        if errorCode == 504:
+            self.connect(self.host, self.port, self.clientId)
         return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
     
+    def fetch_next_day_options_data(self):
+        if self.lastRequestedDateForContracts is not None:
+            plusOneDay = self.lastRequestedDateForContracts + timedelta(days=1)
+            symbols = self.optionUnderlyings
+            self.fetch_options_data(symbols, plusOneDay)
+
+    def reset_options_data(self):
+        send_telegram_message("Resetting options data")
+        with self.optionsDataLock:
+            self.options_data.drop(self.options_data.index, inplace=True)
+
     def filter_options_data(self, symbol, type="C"):
         with self.optionsDataLock:
             # Ensure the boolean Series and DataFrame have the same index
-            mask = (self.options_data["Symbol"] == symbol) & (self.options_data["Type"] == type)
+            mask = (self.options_data["Symbol"] == symbol) & (self.options_data["Type"] == type) & (self.options_data["bid"] > 0) & (self.options_data["ask"] > 0)
             aligned_mask = mask.reindex(self.options_data.index, fill_value=False)
 
             # Print indices for debugging
@@ -725,14 +925,47 @@ class IBApp(IBWrapper, IBClient):
             # Use the aligned boolean Series for indexing
             df_symbol = self.options_data.loc[aligned_mask, :]
             return df_symbol
+    
+    def get_closest_delta_row(self, symbol, target_delta, type="C", nth_closest=1, requiredOTM=True):
+        df = self.filter_options_data(symbol, type)
 
+        if df.empty or not all(col in df.columns for col in ['delta', 'Strike', 'undPrice']):
+            return None
+
+        delta = pd.to_numeric(df['delta'], errors='coerce')
+        strike = pd.to_numeric(df['Strike'], errors='coerce')
+        und_price = pd.to_numeric(df['undPrice'], errors='coerce')
+
+        # Compute distance from target delta (abs(target) to support both sides)
+        delta_diff = (delta.abs() - abs(target_delta)).abs()
+        
+        strike_mask = delta.abs() <= 0.6
+        if requiredOTM:
+            # Determine valid strike positions
+            if type == "C":
+                strike_mask = strike >= und_price
+            elif type == "P":
+                strike_mask = strike <= und_price
+                
+
+        # Combine mask with delta_diff calculation
+        valid_indices = delta_diff[strike_mask].sort_values().index
+
+        if len(valid_indices) <= 0:
+            return
+
+        if nth_closest <= 0 or nth_closest > len(valid_indices):
+            nth_closest = 1
+
+        return df.loc[valid_indices[nth_closest - 1]]
+
+
+    """
     def get_closest_delta_row(self, symbol, target_delta, type="C", nth_closest=1):
         df_symbol = self.filter_options_data(symbol, type)
         # Ensure delta column exists, set default if not
         #df_symbol['delta_diff'] = np.abs(df_symbol.get('delta', pd.Series(0)).abs() - target_delta)
-        """
-        df_symbol['delta_diff'] = np.where(df_symbol['delta'].notna(), np.abs(df_symbol['delta'].abs() - target_delta), np.nan)
-        """
+
 
         df_symbol.loc[:, 'delta_diff'] = np.where(
             (df_symbol['delta'].notna()) & ((df_symbol['delta'] > 0) | (df_symbol['delta'] < 0)),
@@ -748,16 +981,23 @@ class IBApp(IBWrapper, IBClient):
             # Sort by delta_diff to prioritize closest rows
             df_symbol = df_symbol.sort_values(by='delta_diff', ascending=True)
 
+            # if possible, get the closest row, where delta is lower than target_delta
+            df_otm = df_symbol[df_symbol['delta'].abs() <= target_delta]
+
+            if not df_otm.empty:
+                df_symbol = df_otm  
+
             # Check if nth_closest is within bounds
             if nth_closest <= 0 or nth_closest > len(df_symbol):
                 nth_closest = 1
+
 
 
             # Return the nth closest row using iloc
             return df_symbol.iloc[nth_closest - 1]
         else:
             return None
-    
+    """
     def find_closest_strike_row(self, df, strike, option_type):
         """
         Helper function to find the closest row in a DataFrame based on the 'Strike' column.
@@ -779,6 +1019,11 @@ class IBApp(IBWrapper, IBClient):
             if not matching_rows.empty:
                 closest_row = matching_rows.loc[matching_rows["Strike"].idxmax()]
                 return closest_row
+            else:
+                # Look in the opposite direction
+                higher_rows = df[df["Strike"] > strike]
+                if not higher_rows.empty:
+                    return higher_rows.loc[higher_rows["Strike"].idxmin()]
         
         elif option_type == 'call' or option_type == 'C':
             # Find the closest strike greater than or equal to the target strike
@@ -786,8 +1031,41 @@ class IBApp(IBWrapper, IBClient):
             if not matching_rows.empty:
                 closest_row = matching_rows.loc[matching_rows["Strike"].idxmin()]
                 return closest_row
+            else:
+                # Look in the opposite direction
+                lower_rows = df[df["Strike"] < strike]
+                if not lower_rows.empty:
+                    return lower_rows.loc[lower_rows["Strike"].idxmax()]
 
         return None
+    
+    def find_single_contract_by_mid_price(self, symbol, target_midprice, option_type="C"):
+        try:
+            # Check if options data is available
+            if self.options_data.empty:
+                return None
+
+            # Filter options for the given symbol and type
+            df = self.filter_options_data(symbol, option_type)
+
+            # Filter out rows where bid or ask is <= 0
+            filtered_df = df[(df['bid'] > 0) & (df['ask'] > 0)]
+
+            # If filtered data is not empty, find the row closest to the target midprice
+            if not filtered_df.empty:
+                mid_prices = (filtered_df['bid'] + filtered_df['ask']) / 2
+                closest_index = (mid_prices - target_midprice).abs().idxmin()
+                closest_row = filtered_df.loc[closest_index]
+
+                print(closest_row)  # Optional debug print
+                return closest_row
+
+            return None
+
+        except Exception as e:
+            self.addToActionLog("mid price error: " + str(e))
+            return None
+
 
     def find_credit_spread_by_premium(self, symbol, target_premium, current_underlying_price, type="C", max_wingspan=10):
         """
@@ -973,10 +1251,16 @@ class IBApp(IBWrapper, IBClient):
 
     
     def build_credit_spread_dollar(self, symbol, distance, wingspan, type="C"):
+        candleData = self.checkUnderlyingOptions(symbol)
+        current_price = None
+        if candleData is not None:
+            current_price = candleData.get("price")
+
         if (symbol not in self.market_data.index):
             return 
-        row = self.market_data.loc[symbol]
-        current_price = row["Price"]
+        if current_price is None:
+            row = self.market_data.loc[symbol]
+            current_price = row["Price"]
 
         target_strike = current_price + distance
         if type == "P":
@@ -1056,6 +1340,60 @@ class IBApp(IBWrapper, IBClient):
             return {"short_put": delta_row, "long_put": wing_row}
 
         return None
+    
+    def build_credit_spread_by_delta(self, symbol, short_delta, long_delta, type="C", minPrice=None, requiredOTM=True):
+        """
+        Builds a credit spread for the given symbol and target delta.
+        
+        Parameters:
+        - symbol: The underlying symbol for the options.
+        - target_delta: The target delta for the short option.
+        - type: The type of option, either 'C' for call or 'P' for put.
+        - wingspan: The distance between the short and long strikes.
+        - minPrice: Minimum acceptable price for the spread.
+        
+        Returns:
+        A dictionary with the short and long option legs, or None if no valid spread is found.
+        """
+        if self.options_data.empty:
+            return None
+
+        short_row = self.get_closest_delta_row(symbol, short_delta, type, requiredOTM=requiredOTM)
+        long_row = self.get_closest_delta_row(symbol, long_delta, type, requiredOTM=requiredOTM)
+        self.request_options_market_data(short_row)
+        self.request_options_market_data(long_row)
+
+        if short_row is None or long_row is None:
+            return None
+        
+        # validate that strikes are not equal and that they have the correct distance from each other according to type and desired deltas
+        if short_row['Strike'] == long_row['Strike']:
+            if type == "C":
+                if long_delta <= short_delta:
+                    long_row = self.find_closest_strike_for_symbol(symbol, short_row['Strike'] + 1.01, "C")
+                else:
+                    long_row = self.find_closest_strike_for_symbol(symbol, short_row['Strike'] - 1.01, "C")
+            elif type == "P":
+                if long_delta < short_delta:
+                    long_row = self.find_closest_strike_for_symbol(symbol, short_row['Strike'] - 1.01, "P")
+                else:
+                    long_row = self.find_closest_strike_for_symbol(symbol, short_row['Strike'] + 1.01, "P")
+
+            self.request_options_market_data(long_row)
+
+        
+
+        spread = None
+        if type == "C":
+            spread = {"short_call": short_row, "long_call": long_row}
+        elif type == "P":
+            spread = {"short_put": short_row, "long_put": long_row}
+
+        price = TwsOrderAdapter.calcSpreadPrice(spread)
+        if minPrice is not None and abs(price) < minPrice:
+            return None
+
+        return spread
 
     
     def subscribe_to_target_delta(self, symbol, target_delta, type="C"):
@@ -1253,7 +1591,7 @@ class IBApp(IBWrapper, IBClient):
                     # Add the new data to the DataFrame
                     self.candleData[symbol] = pd.concat([self.candleData[symbol], bar_data_df], ignore_index=True)
                     #self.candleData[symbol]['date'] = pd.to_datetime(self.candleData[symbol]['date'], errors='coerce')
-                    self.candleData[symbol]['date'] = pd.to_datetime(self.candleData[symbol]['date'])
+                    #self.candleData[symbol]['date'] = pd.to_datetime(self.candleData[symbol]['date'])
 
                     
 
@@ -1274,8 +1612,13 @@ class IBApp(IBWrapper, IBClient):
                 self.candleData[symbol] = tah.addIndicatorsOn(self, self.candleData[symbol], symbol)
                 
 
-    def get_chart_data(self, mergePredictions = False, symbol = "SPY"):
+    def get_chart_data(self, mergePredictions = False, sym = "SPY"):
         data = None
+        symbol = sym
+        if self.focusContract is not None:
+            symbol, _, _ = self.focusContract
+
+
         with self.candleLock:
             if (symbol not in self.candleData):
                 data =  pd.DataFrame()
@@ -1306,7 +1649,11 @@ class IBApp(IBWrapper, IBClient):
         return super().historicalDataUpdate(reqId, bar)
 
 
-    def checkUnderlyingOptions(self, symbol="SPY"):
+    def checkUnderlyingOptions(self, sym="SPY"):
+        symbol = sym
+        if self.focusContract is not None:
+            symbol, _, _ = self.focusContract
+        
         signal = None
 
         date = None
@@ -1315,6 +1662,7 @@ class IBApp(IBWrapper, IBClient):
         row = None
         sentiment = None
         prevSentiment = None
+        price = None
         with self.candleLock:
             if (symbol in self.candleData):
                 df: pd.DataFrame = self.candleData[symbol]
@@ -1323,14 +1671,16 @@ class IBApp(IBWrapper, IBClient):
                     rowBeforeRow = df.loc[df["date"].idxmax() - 1] if len(df) > 1 else None
 
 
-                    signal = row["final_signal"]
-                    date = row["date"]
+                    signal = row["final_signal"] 
+                    date = row.get("datetime") or row["date"]
                     put = row["put_strike"]
                     call = row["call_strike"]
                     sentiment = row["sentiment"]
+                    price = row["close"]
                     prevSentiment = rowBeforeRow["sentiment"] if rowBeforeRow is not None else None
             return {
                 "date": date,
+                "price": price,
                 "signal": signal,
                 "sentiment": sentiment,
                 "prevSentiment": prevSentiment,
@@ -1358,7 +1708,7 @@ class IBApp(IBWrapper, IBClient):
                 # Generate all possible columns with and without prefixes
                 prefixes = [p[1] for p in self.marketDataPrefix]
                 base_columns = ["date", "open", "close", "high", "low", "volume", "wap", "count"]
-                columns = ["date", "open", "close", "night_gap", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist", "p_dist", "final_signal", "tech_signal", "high", "low", "sentiment", "volume", "wap", "count"]
+                columns = ["date", "open", "close", "night_gap", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist", "p_dist", "final_signal", "tech_signal", "high", "low", "strategy", "sentiment", "volume", "wap", "count"]
 
                 for pre in prefixes:
                     for col in base_columns:

@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 import numpy as np
 
+from util.Logger import Logger
+
 class IBWrapper(EWrapper):
     def __init__(self, market_data_dict):
         EWrapper.__init__(self)
@@ -127,11 +129,13 @@ class IBWrapper(EWrapper):
             id = entry["id"]
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
             with self.optionsDataLock:
+                """
                 if text.startswith("delayed_"):
                       delayed_text = text[len("delayed_"):]
                       val =  self.options_data.loc[id, delayed_text]
                       if not (val > 0):
                           text = delayed_text
+                """
                 self.options_data.loc[id, text] = price
                 self.options_data.loc[id, "time"] = datetime.now(timezone.utc)
 
@@ -178,7 +182,12 @@ class IBWrapper(EWrapper):
                 self.options_data['ask'],
                 np.where((self.options_data['last'] >= 0), self.options_data['last'], self.options_data['close'])
             )
-        
+
+    @iswrapper
+    def error(self, reqId, errorTime, errorCode, errorString, advancedOrderRejectJson=""):
+        Logger.log(f"Error. Id: {reqId}, Time: {errorTime}, Code: {errorCode}, Msg: {errorString}")
+        return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+
     @iswrapper
     def contractDetails(self, reqId: int, contractDetails: ContractDetails):
         
