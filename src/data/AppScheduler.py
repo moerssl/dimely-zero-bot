@@ -364,7 +364,7 @@ class AppScheduler:
     def checkSecondaryDeltaTrade(self):
         self.app.addToActionLog("CHECKING DELTA TRADE "+ self.secondarySymbol)
         if self.orderApp.is_room_for_new_positions(self.secondarySymbol) and self.hasWarmedUp(): 
-            vixPrice = self.app.getPriceForSybol("VIX")
+            vixPrice = self.app.getPriceForSymbol("VIX")
             self.app.addToActionLog("Ordering 2100 Iron Condor")
             self.checkDeltaTradeForSymbol(self.secondarySymbol)
 

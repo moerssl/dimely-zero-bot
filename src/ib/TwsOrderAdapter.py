@@ -113,9 +113,9 @@ class TwsOrderAdapter(EWrapper, EClient):
         for key, row in contract_rows.items():
             if row is not None:
                 if "long" in key:
-                    limit_price += row["ask"]  # Ask price for long legs
+                    limit_price += row.get("ask",0)  # Ask price for long legs
                 elif "short" in key:
-                    limit_price -= row["bid"]  # Bid price for short legs
+                    limit_price -= row.get("bid",0)  # Bid price for short legs
         return limit_price
     
     def calculateSpreadMidPrice(contract_rows, start=0.0):
@@ -679,9 +679,9 @@ class TwsOrderAdapter(EWrapper, EClient):
         except Exception as e:
             self.addToActionLog("Error placing order: " + str(e))
 
-    def place_single_contract_order(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None):
+    def place_single_contract_order(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None, mid=None, doTransmit=True):
         # start a new thread to place the order
-        thread = Thread(target=self.place_single_contract_order_threaded, args=(row, action, quantity, orderType, orderRef, tp, sl))
+        thread = Thread(target=self.place_single_contract_order_threaded, args=(row, action, quantity, orderType, orderRef, tp, sl, mid, doTransmit))
         thread.start()
 
     def placeOrder(self, orderId, contract, order):        
@@ -703,12 +703,12 @@ class TwsOrderAdapter(EWrapper, EClient):
             if len(contract.comboLegs) == 0:
                 contractReceived = self.receivedContracts.get(contract.conId, None)
                 if contractReceived is not None:
-                    contractText += f"{contractReceived['Symbol']} {contractReceived['Right']} {contractReceived['Strike']} {contractReceived['Expiry']}\n"
+                    contractText += f"{contractReceived.get('Symbol','')} {contractReceived.get('Right','')} {contractReceived.get('Strike','')} {contractReceived.get('Expiry','')}\n"
             else:
                 for leg in contract.comboLegs:
                     contractReceived = self.receivedContracts.get(leg.conId, None)
                     if contractReceived is not None:
-                        contractText += f"{leg.action} {contractReceived['Symbol']} {contractReceived['Right']} {contractReceived['Strike']} {contractReceived['Expiry']}\n"
+                        contractText += f"{contractReceived.get('Symbol','')} {contractReceived.get('Right','')} {contractReceived.get('Strike','')} {contractReceived.get('Expiry','')}\n"
             if (contractText != ""):
                 send_telegram_message(contractText)
             else:
@@ -721,7 +721,7 @@ class TwsOrderAdapter(EWrapper, EClient):
 
         return super().placeOrder(orderId, contract, order)
     
-    def place_single_contract_order_threaded(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None):
+    def place_single_contract_order_threaded(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None, mid=None, doTransmit=True):
         
         try:
             with self.orderLock:
@@ -744,13 +744,16 @@ class TwsOrderAdapter(EWrapper, EClient):
                     multiple = 0.05
                     makeItMarketable = 0.05
 
-                # use bid or ask price based on action
-                if action == "BUY":
-                    price = row.get("ask")
-                else:
-                    price = row.get("bid")
+                if mid is None:
+                    # use bid or ask price based on action
+                    if action == "BUY":
+                        price = row.get("ask")
+                    else:
+                        price = row.get("bid")
 
-                midPrice = (row.get("ask") + row.get("bid")) / 2 if row.get("ask") is not None and row.get("bid") is not None else None
+                    midPrice = (row.get("ask") + row.get("bid")) / 2 if row.get("ask") is not None and row.get("bid") is not None else None
+                else:
+                    midPrice = mid
 
                 price = self.round_to_next_multiple(midPrice, multiple)
                 
@@ -779,11 +782,11 @@ class TwsOrderAdapter(EWrapper, EClient):
                     slOrder.parentId = parentOrderId
 
                 if slOrder is not None:
-                    slOrder.transmit = True
+                    slOrder.transmit = doTransmit
                 elif tpOrder is not None:
-                    tpOrder.transmit = True
+                    tpOrder.transmit = doTransmit
                 else:
-                    parentOrder.transmit = True
+                    parentOrder.transmit = doTransmit
 
                 self.placeOrder(parentOrderId, contract, parentOrder)
                 time.sleep(0.1)  # Small delay to ensure order is placed before next one
@@ -847,6 +850,8 @@ class TwsOrderAdapter(EWrapper, EClient):
 
     @iswrapper
     def openOrder(self, orderId: int, contract: Contract, order: Order, orderState: OrderState):
+        Logger.log(f"Received Order {contract}")
+       
         # Check if order has a combo contract
         if (len(contract.comboLegs) > 0):
             for leg in contract.comboLegs:
@@ -885,6 +890,7 @@ class TwsOrderAdapter(EWrapper, EClient):
     
     @iswrapper
     def orderStatus(self, orderId, status, filled, remaining, avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
+        Logger.logText(f"Order status {orderId}, {status}")
         if status == "Filled":
             self.addToActionLog(f"Order {orderId} filled: {filled} at {avgFillPrice}")
             Logger.log(f"Order {orderId} filled: {filled} at {avgFillPrice}")
@@ -958,6 +964,17 @@ class TwsOrderAdapter(EWrapper, EClient):
                 if type is None or (type is not None and position["right"] == type):
                     return True
         return False
+    
+    def hasOptionPositionsForSymbol(self, symbol):
+        #self.positions[contract.conId]["underConId"] = contract.underConId
+        for conId, position in self.positions.items():
+            if position["symbol"] == symbol:
+                # Stock positions weigh more than options positions
+                if position["secType"] == "OPT":
+                    return True
+        
+        return False
+
 
     def has_existing_order_contracts(self, contract_rows: dict):
         """
@@ -966,12 +983,16 @@ class TwsOrderAdapter(EWrapper, EClient):
         :return: True if existing order contracts are found, False otherwise.
         """
         if (self.orderContracts is None or len(self.orderContracts) == 0):
-            return False
+           Logger.log(self.orderContracts)
+           return False
         for key, row in contract_rows.items():
             if row["ConId"] in self.orderContracts:
                 return True
         return False
-
+    
+    def get_all_orders(self):
+        return self.orderContracts
+    
     def is_room_for_new_positions(self, symbol, opt_type=None):
         hasPositions = self.hasPositionsForSymbol(symbol, opt_type)
         if hasPositions:

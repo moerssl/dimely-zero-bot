@@ -62,14 +62,14 @@ async def main():
     focusSymbol = (symbolParam, "STK", "SMART")
     if symbolParam.lower() == "spx" or symbolParam.lower() == "xsp":
         focusSymbol = (symbolParam.upper(), "IND", "CBOE")
-    secondarySymbol = ("SPX", "IND", "CBOE")
+    
     thirdSymbol = ("SPY", "STK", "SMART")
     vix = ("VIX", "IND", "CBOE")
 
     focusContractSymbol, _, _  = focusSymbol
-    secondaryContractSymbol, _, _ = secondarySymbol
+    
 
-    scheduler = ConfigAppScheduler(app, orderApp, historyApp,symbol=focusContractSymbol, secondSymbol=secondarySymbol[0])
+    scheduler = ConfigAppScheduler(app, orderApp, historyApp,symbol=focusContractSymbol)
     orderApp.actionLog = app.actionLog
     startClientId = stock_symbol_to_client_id(symbolParam, max_id=9999)
     def next_client_id():
@@ -134,6 +134,10 @@ async def main():
     app.additionalTilesFuncs.append({
         "function": lambda: orderApp.is_room_for_new_positions(symbolParam),
         "title": "Room for New Positions " + symbolParam,
+    })
+    app.additionalTilesFuncs.append({
+        "function": lambda: orderApp.get_all_orders(),
+        "title": "Orders " + symbolParam,
     })
     tomorrow = pd.Timestamp.now() + pd.Timedelta(days=1)
     

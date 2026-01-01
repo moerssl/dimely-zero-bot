@@ -25,26 +25,9 @@
                 "display": false
             }
         ],
-        "IWM": [
+        "GLW": [
             {
-                "id": "checkDeltaIronCondor_IWM",
-                "function": "checkDeltaIronCondor",
-                "terminalTitle": true,
-
-                "day_of_week": "mon-fri",
-                "hour": 13,
-                "minute": "57-59",
-                "second": "0/30",
-                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT6174920812210117393",
-
-                "kwargs": {
-                    "short_delta": 0.4,
-                    "long_delta": 0.1
-                }
-                
-            },
-            {
-                "id": "checkWheel_IWM",
+                "id": "checkWheel",
                 "function": "checkWheelTrade",
                 "terminalTitle": false,
 
@@ -66,7 +49,7 @@
                 ]
             },
             {
-                "id": "shutdown_IWM",
+                "id": "shutdown",
                 "function": "shutdown",
                 "multi": [
                     {
@@ -78,7 +61,99 @@
                     {
                         "day_of_week": "mon-fri",
                         "hour": 14,
-                        "minute": "02"
+                        "minute": "07"
+                    }
+                ],
+
+                "display": false
+            }
+
+        ],
+        "IWM": [
+            {
+                "id": "checkDeltaIronCondor_IWM",
+                "function": "checkDeltaIronCondor",
+                "terminalTitle": true,
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": 13,
+                        "minute": "57-59",
+                        "second": "0/30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": 14,
+                        "minute": "00-14",
+                        "second": "0/30"
+                    }
+                ],
+                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT6174920812210117393",
+
+                "kwargs": {
+                    "short_delta": 0.4,
+                    "long_delta": 0.1
+                }
+                
+            },
+            {
+                "id": "checkWheel_IWM",
+                "function": "checkDeltaWheelTrade",
+                "terminalTitle": false,
+
+                
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "9",
+                        "minute": "35-59",
+                        "second": "0/30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "10-13",
+                        "minute": "*",
+                        "second": "0/30"
+                    }
+                    
+                ]
+            },
+            {
+                "id": "checkLongPosition_IWM",
+                "function": "checkLongPositionTakeProfit",
+                "terminalTitle": false,
+
+                
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "9",
+                        "minute": "34-59",
+                        "second": "10,40,59"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "10-13",
+                        "minute": "*",
+                        "second": "0/30"
+                    }
+                    
+                ]
+            },
+            {
+                "id": "shutdown_IWM",
+                "function": "shutdown",
+                "multi": [
+                    {
+                        "day_of_week": "*",
+                        "hour": "10",
+                        "minute": "16",
+                        "second": "30"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": 14,
+                        "minute": "15"
                     }
                 ],
 

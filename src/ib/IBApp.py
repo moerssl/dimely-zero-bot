@@ -286,6 +286,32 @@ class IBApp(IBWrapper, IBClient):
         self.reqMktData(req, contract, "", False, False, [])
         time.sleep(0.1)  # To avoid pacing violations
 
+    def business_days_since_last_request(self, inclusive: bool = True) -> int:
+        if not hasattr(self, "lastRequestedDateForContracts") or self.lastRequestedDateForContracts is None:
+            return 1
+        
+
+        try:
+            today = datetime.today().date()
+            other = self.lastRequestedDateForContracts.date()
+
+            # ensure start <= end for calculation, remember sign
+            start, end = (other, today) if other <= today else (today, other)
+            sign = 1 if other <= today else -1
+
+            days = (end - start).days + (1 if inclusive else 0)
+            weeks, extra = divmod(days, 7)
+            business_days = weeks * 5
+
+            # handle the leftover days
+            start_weekday = start.weekday()  # 0=Mon .. 6=Sun
+            for i in range(extra):
+                if (start_weekday + i) % 7 < 5:
+                    business_days += 1
+            
+            return abs(sign * business_days)
+        except Exception as err:
+            return 1
 
     def fetch_options_data(self, symbols, date: datetime = datetime.today()):
         self.lastRequestedDateForContracts = date
@@ -370,7 +396,7 @@ class IBApp(IBWrapper, IBClient):
 
         return iron_condor_rows
 
-    def getPriceForSybol(self, symbol):
+    def getPriceForSymbol(self, symbol):
         if (symbol not in self.market_data.index):
             return None
         
@@ -378,7 +404,7 @@ class IBApp(IBWrapper, IBClient):
         return row["Price"]
 
     def construct_from_underlying(self, symbol, distance=5.0, wingspan=5.0):
-        current_price = self.getPriceForSybol(symbol)   
+        current_price = self.getPriceForSymbol(symbol)   
         if current_price is None:
             return
         with self.optionsDataLock:
@@ -901,11 +927,20 @@ class IBApp(IBWrapper, IBClient):
             self.connect(self.host, self.port, self.clientId)
         return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
     
-    def fetch_next_day_options_data(self):
-        if self.lastRequestedDateForContracts is not None:
-            plusOneDay = self.lastRequestedDateForContracts + timedelta(days=1)
+    def fetch_next_day_options_data(self, daysToAdd=1):
+        plus_one = datetime.today() + timedelta(days=daysToAdd)
+        try:
+            if self.lastRequestedDateForContracts is not None:
+                plus_one = self.lastRequestedDateForContracts + timedelta(days=daysToAdd)
+                if plus_one.weekday() == 5:  # Saturday
+                    return plus_one + timedelta(days=daysToAdd+2)
+                elif plus_one.weekday() == 6:  # Sunday
+                    return plus_one + timedelta(days=daysToAdd+1) 
+        finally:
             symbols = self.optionUnderlyings
-            self.fetch_options_data(symbols, plusOneDay)
+            self.fetch_options_data(symbols, plus_one)
+
+
 
     def reset_options_data(self):
         send_telegram_message("Resetting options data")
@@ -959,7 +994,44 @@ class IBApp(IBWrapper, IBClient):
 
         return df.loc[valid_indices[nth_closest - 1]]
 
+    def get_by_delta_or_lower_by_dte(self, symbol, target_delta, minPrice, type="C"):
+        df = self.filter_options_data(symbol, type)
 
+        if df.empty or not all(col in df.columns for col in ['delta', 'Strike', 'undPrice', 'Expiry', 'ask']):
+            return None
+
+        # Convert to numeric types
+        delta = pd.to_numeric(df['delta'], errors='coerce')
+        strike = pd.to_numeric(df['Strike'], errors='coerce')
+        und_price = pd.to_numeric(df['undPrice'], errors='coerce')
+        ask = pd.to_numeric(df['ask'], errors='coerce')
+        expiry = pd.to_datetime(df['Expiry'], errors='coerce')
+
+        # Mask: abs(delta) <= target_delta and ask >= minPrice
+        mask = (delta.abs() <= abs(target_delta)) & (ask >= minPrice)
+
+        # Compute DTE
+        today = pd.Timestamp.today().normalize()
+        dte = (expiry - today).dt.days
+
+        # Apply mask and filter valid expiries
+        valid = df[mask & (dte >= 0)].copy()
+        if valid.empty:
+            return None
+
+        valid['DTE'] = dte[mask & (dte >= 0)]
+
+        # Sort by DTE ascending, then by ask descending (or strike, depending on preference)
+        sorted_idx = valid.sort_values(['DTE']).index
+
+        if len(sorted_idx) <= 0:
+            return None
+
+        # Return the first row (lowest DTE)
+        return valid.loc[sorted_idx[0]]
+        
+
+    
     """
     def get_closest_delta_row(self, symbol, target_delta, type="C", nth_closest=1):
         df_symbol = self.filter_options_data(symbol, type)
@@ -1747,7 +1819,7 @@ class IBApp(IBWrapper, IBClient):
         symbol = contract.symbol
 
         #Check for underlying price
-        current_price = self.getPriceForSybol(symbol)   
+        current_price = self.getPriceForSymbol(symbol)   
         if current_price is None:
             return
         

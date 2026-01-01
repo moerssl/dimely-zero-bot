@@ -16,5 +16,7 @@
 			"path": "../tasty-bot"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"prisma.pinToPrisma6": true
+	}
 }

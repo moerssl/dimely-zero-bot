@@ -6,6 +6,7 @@ from data.OrbResult import OrbResult
 from data.BaseAppScheduler import BaseAppScheduler
 from ib.TwsOrderAdapter import TwsOrderAdapter
 from ib.IBApp import IBApp
+from ibapi.contract import Contract
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.combining import OrTrigger
 import json
@@ -165,10 +166,12 @@ class ConfigAppScheduler(BaseAppScheduler):
 
             try:
                 # Define the desired order of keys
-                key_order = ["long_call", "short_call", "short_put", "long_put"]
+                key_order = ["long_call", "short_call", "short_put", "long_put", "short_stock", "long_stock"]
 
                 # Ensure all expected keys are present, assigning None if missing
                 ordered_legs = {key: legs.get(key, None) for key in key_order}
+                if len(ordered_legs) == 0:
+                    return legs
 
                 return IBApp.defineSpreadTile("", ordered_legs, 2, kwargs.get("tp", 1))
             except Exception as e:
@@ -208,13 +211,38 @@ class ConfigAppScheduler(BaseAppScheduler):
 
                 undPrice = shortCall["undPrice"]
 
-                if (shortCallStrike < shortPutStrike):
+                max_attempts = 3
+                attempts = 0
+                
+                while shortCallStrike < shortPutStrike and attempts < max_attempts:
+                    # compute credit‐spread width and mirror the OTM distance
                     callDistance = longCallStrike - shortCallStrike
-                    otmDistance = shortCallStrike - undPrice
-
+                    otmDistance  = abs(shortCallStrike - undPrice)
                     desiredPutStrike = undPrice - otmDistance
 
-                    putLegs = self.app.find_credit_spread_legs(self.symbol, desiredPutStrike, "P", callDistance)
+                    # rebuild the put side
+                    putLegs = self.app.find_credit_spread_legs(
+                        self.symbol,
+                        desiredPutStrike,
+                        "P",
+                        callDistance
+                    )
+
+                    # extract the new put strikes
+                    shortPut = putLegs.get("short_put", {})
+                    longPut  = putLegs.get("long_put", {})
+                    shortPutStrike = shortPut.get("Strike")
+                    longPutStrike  = longPut.get("Strike")
+
+                    attempts += 1
+                
+                # if still inverted after retries, bail out
+                if shortCallStrike < shortPutStrike:
+                    self.app.addToActionLog(
+                        f"Iron Condor inversion persists after {attempts} attempts "
+                        f"(call {shortCallStrike} < put {shortPutStrike}), skipping"
+                    )
+                    return
             except Exception as e:
                 self.app.addToActionLog(str(e))
                 Logger.log(str(e))
@@ -227,6 +255,8 @@ class ConfigAppScheduler(BaseAppScheduler):
 
         if callLegs is None or putLegs is None:
             self.app.addToActionLog("No valid legs found for Delta Iron Condor trade")
+            if order:
+                send_telegram_message(f"No valid legs found for Delta Iron Condor trade for {self.symbol}")
             return
 
         icLegs = {**callLegs, **putLegs}
@@ -245,6 +275,7 @@ class ConfigAppScheduler(BaseAppScheduler):
 
         if absSpreadDistance > maxSpreadDistance:
             self.app.addToActionLog(f"Spread distance {absSpreadDistance} is wide small, not placing order")
+            send_telegram_message(f"Delta Iron Condor spread distance {absSpreadDistance} is wide small for {self.symbol}, not placing order")
             return
         self.orderApp.place_combo_order(icLegs, None, None, orderRef, getOutOfMarket=False, touchDistance=None)
         sleep(0.5)
@@ -537,32 +568,42 @@ class ConfigAppScheduler(BaseAppScheduler):
         
         amountOfShares = stock_position.get("position", 0)
         amountOfContracts = abs(amountOfShares // 100)
-        targetStrikeByPosition = stock_position.get("avgCost", 0)
+        targetStrikeByPosition = stock_position.get("avgCost", None)
         underlyingPrice = self.app.checkUnderlyingOptions(self.symbol).get("price", 0)
         targetPrice = None
         targetType = None
+        daysBetween = self.app.business_days_since_last_request()
+        referenceDistance = underlyingPrice * (0.02 * daysBetween)
 
         if underlyingPrice is None or targetStrikeByPosition is None:
             return
 
         if amountOfShares <= 0: # short position, consider selling puts
-            # check for existung put positions
-            
-            if self.orderApp.hasPositionsForSymbol(self.symbol, putType) and order:
-                return
-            
             targetPrice = min(targetStrikeByPosition, underlyingPrice - distance)
             targetPrice = math.floor(targetPrice)
             targetType = putType
+
+            if math.floor(underlyingPrice) - targetPrice > referenceDistance:
+                oldTargetPrice = targetPrice
+                targetPrice = math.floor(underlyingPrice - referenceDistance) 
+                #self.app.addToActionLog(f"Target price for puts is too far from underlying price, adjusting to max 5 below. Underlying: {underlyingPrice}, Old Target: {oldTargetPrice} New Target: {targetPrice}")
+                Logger.log(f"Target price for puts is too far from underlying price, adjusting to max {referenceDistance} below. Underlying: {underlyingPrice}, Old Target: {oldTargetPrice}, New Target: {targetPrice}")
             
 
         else: # long position, consider selling calls
-            if self.orderApp.hasPositionsForSymbol(self.symbol, callType) and order:
-                return
-            
             targetPrice = max(targetStrikeByPosition, underlyingPrice + distance)
             targetPrice = math.ceil(targetPrice)
             targetType = callType
+
+
+            if targetPrice - math.ceil(underlyingPrice) > referenceDistance:
+                oldTargetPrice = targetPrice                
+                targetPrice = math.ceil(underlyingPrice + referenceDistance) 
+
+                
+
+                #self.app.addToActionLog(f"Target price for calls is too far from underlying price, adjusting to max 5 above. Underlying: {underlyingPrice}, Old Target: {oldTargetPrice} New Target: {targetPrice}")
+                Logger.log(f"Target price for calls is too far from underlying price, adjusting to max  {referenceDistance} above. Underlying: {underlyingPrice}, Old Target: {oldTargetPrice}, New Target: {targetPrice}")
 
         if targetPrice is None or targetType is None:
             self.app.addToActionLog("No valid target price or type for Wheel Trade")
@@ -580,6 +621,7 @@ class ConfigAppScheduler(BaseAppScheduler):
            
             if optionContract is None:
                 self.app.addToActionLog("No valid option contract found for Wheel Trade")
+                Logger.log(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}")
                 if self.isWheelThresoldTimePassed():
                     send_telegram_message(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}, trying next day options data")
                     self.goForNextDayOptionsData()
@@ -608,6 +650,105 @@ class ConfigAppScheduler(BaseAppScheduler):
 
                 return
             
+            if self.orderApp.hasPositionsForSymbol(self.symbol, targetType):
+                self.app.addToActionLog(f"Existing position found for {self.symbol} {targetType}, not placing new Wheel Trade order")
+                return
+            
+            self.app.addToActionLog(f"Placing Wheel Trade order for {self.symbol} at {targetPrice} with type {targetType}")
+            if self.orderApp.has_existing_order_contracts({f"short_{'put' if targetType == putType else 'call'}": optionContract}):
+                self.app.addToActionLog(f"Existing order found for {self.symbol} {targetType} at {targetPrice}, not placing duplicate order")
+                return
+            self.orderApp.place_single_contract_order(optionContract, orderRef="WheelTrade", action="SELL", quantity=amountOfContracts)
+            sleep(0.5)
+        else:
+            if targetType == putType:
+                return {
+                    "short_put": optionContract
+                }
+            elif targetType == callType:
+                return {
+                    "short_call": optionContract
+                }
+            return optionContract
+
+
+
+    def checkDeltaWheelTrade(self, distance=0.2, zeroDteMinPrice=0.2, xDteMinPrice=0.25, order=True):
+        putType = "P"
+        callType = "C"
+
+        # check for existing stock position
+        stock_position = self.orderApp.getStockPositionsForSymbol(self.symbol)
+        if stock_position is None:
+            return
+        
+        if self.currentDteWheelMinPrice is None:
+            self.currentDteWheelMinPrice = zeroDteMinPrice
+        
+        amountOfShares = stock_position.get("position", 0)
+        amountOfContracts = abs(amountOfShares // 100)
+        targetStrikeByPosition = stock_position.get("avgCost", None)
+        underlyingPrice = self.app.checkUnderlyingOptions(self.symbol).get("price", 0)
+        targetPrice = None
+        targetType = None
+        daysBetween = self.app.business_days_since_last_request()
+        
+
+        if underlyingPrice is None or targetStrikeByPosition is None:
+            return
+
+        if amountOfShares <= 0: # short position, consider selling puts
+            targetType = putType
+
+        else: # long position, consider selling calls
+            targetType = callType
+        
+        optionContract = self.app.find_closest_strike_for_symbol(self.symbol, targetPrice, targetType)
+        optionContract = self.app.get_by_delta_or_lower_by_dte(self.symbol, 0.3, self.currentDteWheelMinPrice, targetType)
+        if order:
+            
+            if not self.hasWarmedUp():
+                self.app.addToActionLog("Awaiting warmup for Wheel Trade")
+                return
+            
+            if self.firstWheelAttemptTime is None:
+                self.firstWheelAttemptTime = datetime.now()
+           
+            if optionContract is None:
+                self.app.addToActionLog("No valid option contract found for Wheel Trade")
+                Logger.log(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}")
+                if self.isWheelThresoldTimePassed():
+                    send_telegram_message(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}, trying next day options data")
+                    self.goForNextDayOptionsData()
+                    self.firstWheelAttemptTime = None
+                return
+            
+            midPrice = (optionContract.get("ask") + optionContract.get("bid")) / 2 if optionContract.get("ask") is not None and optionContract.get("bid") is not None else None
+            
+            if midPrice is None or midPrice < self.currentDteWheelMinPrice:
+                self.app.addToActionLog(f"Mid price for {self.symbol} {targetType} at {targetPrice} is too low: {midPrice}, not placing order")
+                Logger.log(f"Mid price for {self.symbol} {targetType} at {targetPrice} is too low: {midPrice}, not placing order")
+
+                try:
+                    # when no valid price is found within 5 minutes, try next day options data
+                    
+                    if self.isWheelThresoldTimePassed():
+                        self.app.addToActionLog("No valid price found for Wheel Trade within 15 minutes, fetching next day options data")
+                        send_telegram_message(f"Mid price for {self.symbol} {targetType} at {targetPrice} is too low: {midPrice}, trying next day options data")
+                        self.currentDteWheelMinPrice = xDteMinPrice
+
+                        self.goForNextDayOptionsData(7)
+                        self.firstWheelAttemptTime = None
+                except Exception as e:
+                    Logger.log(f"Error while checking time for next day options data fetch: {e}")
+
+
+                return
+            
+            if self.orderApp.hasPositionsForSymbol(self.symbol, targetType):
+                self.app.addToActionLog(f"Existing position found for {self.symbol} {targetType}, not placing new Wheel Trade order")
+                return
+            
             self.app.addToActionLog(f"Placing Wheel Trade order for {self.symbol} at {targetPrice} with type {targetType}")
             if self.orderApp.has_existing_order_contracts({f"short_{'put' if targetType == putType else 'call'}": optionContract}):
                 self.app.addToActionLog(f"Existing order found for {self.symbol} {targetType} at {targetPrice}, not placing duplicate order")
@@ -625,14 +766,74 @@ class ConfigAppScheduler(BaseAppScheduler):
                 }
             return optionContract
         
-    def goForNextDayOptionsData(self):
+    def checkLongPositionTakeProfit(self, requiredDistance=5, order=True):
+        # check for existing stock position
+        stock_position = self.orderApp.getStockPositionsForSymbol(self.symbol)
+        if stock_position is None:
+            return "No stock position"
+        
+        amountOfShares = stock_position.get("position", 0)
+        targetStrikeByPosition = stock_position.get("avgCost", None)
+        # underlyingPrice = self.app.checkUnderlyingOptions(self.symbol).get("price", 0)
+        underlyingPrice = self.app.getPriceForSymbol(self.symbol)
+
+        closingAction = "SELL"
+        if amountOfShares < 0:
+            return "Less shares"
+
+        if not targetStrikeByPosition:
+            return "no avg price"
+        
+        if not underlyingPrice:
+            return "no underlyng price"
+        
+        contract: Contract = stock_position["contract"]
+        dictContract = {
+            "ConId": contract.conId,
+            "Symbol": contract.symbol            
+        }
+        currentDistance = underlyingPrice - targetStrikeByPosition
+        if order:
+            if not self.hasWarmedUp():
+                self.app.addToActionLog("Awaiting warmup for checkLongPositionTakeProfit")
+                return
+            if self.orderApp.has_existing_order_contracts({"stock": dictContract}):
+                return
+            
+            if (self.orderApp.hasOptionPositionsForSymbol(contract.symbol)):
+                self.app.addToActionLog(f"Existing option positions found for {contract.symbol}, not placing order")
+                return
+            if currentDistance < requiredDistance:
+                self.app.addToActionLog(f"Required distance for {contract.symbol} not met, not placing stock order")
+                return 
+            self.orderApp.place_single_contract_order(dictContract, orderRef="LongPositionTakeProfit", action=closingAction, quantity=amountOfShares, mid=underlyingPrice, doTransmit=False)
+        else:
+            dictContract["mid"] = underlyingPrice
+            dictContract["bid"] = underlyingPrice
+            dictContract["ask"] = underlyingPrice
+            dictContract["currentDistance"] = currentDistance
+            dictContract["reqDistance"] = requiredDistance
+            dictContract["closePosition"] =  currentDistance > requiredDistance
+            return  {
+                "long_stock":dictContract
+            }
+
+
+    def goForNextDayOptionsData(self, daysToAdd=1):
         if self.hasWarmedUp():
             self.app.addToActionLog("Fetching next day options data")
             self.app.cancel_all_options_market_data()
-            self.app.reset_options_data()
-            self.reset_start_time()
+            try:
+                self.app.reset_options_data()
+                self.reset_start_time()
+            except Exception as error:
+                self.app.addToActionLog("Error resetting optionbs data")
+            try:
 
-            self.app.fetch_next_day_options_data()
+                self.app.fetch_next_day_options_data(daysToAdd)
+            except Exception as error:
+                self.app.addToActionLog("error fetchiung next day")
+
 
     def load_config(self):
         """Load job configuration from JSON file, filtered by symbol."""
