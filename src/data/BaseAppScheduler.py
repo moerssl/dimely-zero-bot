@@ -40,7 +40,7 @@ class BaseAppScheduler:
 
         self.callDistance, self.putDistance, self.wing_span, self.target_premium, self.ic_wingspan, self.tp_percentage, self.sl_percentag, self.call_delta, self.put_delta = app.get_offset_configs(symbol)
 
-        self.warmUpThreshold = timedelta(minutes=1)
+        self.warmUpThreshold = timedelta(seconds=150)
         self.startTime = datetime.now()
         self.historySymbols = None
         self.minPrice = 0.2
@@ -55,12 +55,12 @@ class BaseAppScheduler:
     def reset_start_time(self):
         self.startTime = datetime.now()
 
-    def hasWarmedUp(self):
+    def hasWarmedUp(self, multiplier=1):
         """
         Check if the scheduler has warmed up by comparing the current time with the start time.
         """
         warmUpTime = datetime.now() - self.startTime
-        return warmUpTime >= self.warmUpThreshold
+        return warmUpTime >= self.warmUpThreshold * multiplier
     
 
     def get_jobs_dataframe(self):
