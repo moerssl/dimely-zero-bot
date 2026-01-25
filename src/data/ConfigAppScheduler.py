@@ -30,6 +30,7 @@ class ConfigAppScheduler(BaseAppScheduler):
         self.load_config()
 
         self.currentDteWheelMinPrice = None
+        self.daySteps = 0
 
         Logger.log("Scheduler started")
      
@@ -254,7 +255,7 @@ class ConfigAppScheduler(BaseAppScheduler):
             
 
         if callLegs is None or putLegs is None:
-            self.app.addToActionLog("No valid legs found for Delta Iron Condor trade")
+            
             if order:
                 send_telegram_message(f"No valid legs found for Delta Iron Condor trade for {self.symbol}")
             return
@@ -680,7 +681,7 @@ class ConfigAppScheduler(BaseAppScheduler):
         # check for existing stock position
         stock_position = self.orderApp.getStockPositionsForSymbol(self.symbol)
         if stock_position is None:
-            return
+            return "No stock position found"
         
         if self.currentDteWheelMinPrice is None:
             self.currentDteWheelMinPrice = zeroDteMinPrice
@@ -695,16 +696,25 @@ class ConfigAppScheduler(BaseAppScheduler):
         
 
         if underlyingPrice is None or targetStrikeByPosition is None:
-            return
+            return f"Prices not found underlying: {underlyingPrice}, targetStrikePrice {targetStrikeByPosition}"
 
         if amountOfShares <= 0: # short position, consider selling puts
             targetType = putType
+            targetPrice = math.floor(targetStrikeByPosition)
 
         else: # long position, consider selling calls
             targetType = callType
+            targetPrice = math.ceil(targetStrikeByPosition)
         
-        optionContract = self.app.find_closest_strike_for_symbol(self.symbol, targetPrice, targetType)
-        optionContract = self.app.get_by_delta_or_lower_by_dte(self.symbol, 0.3, self.currentDteWheelMinPrice, targetType)
+        optionContract = self.app.get_by_delta_or_lower_by_dte(self.symbol, 0.3, self.currentDteWheelMinPrice, targetType, target_underlying_price=targetPrice)
+        optionContractTargetStrike = None
+        if optionContract is not None:
+            optionContractTargetStrike = optionContract.get("Strike")
+        """
+        if targetType == putType and optionContractTargetStrike > targetStrikeByPosition:
+            optionContract = self.app.find_closest_strike_for_symbol(self.symbol, targetPrice, targetType)
+        if targetType == callType and optionContractTargetStrike < targetStrikeByPosition:
+        """
         if order:
             
             if not self.hasWarmedUp():
@@ -723,6 +733,16 @@ class ConfigAppScheduler(BaseAppScheduler):
                     self.firstWheelAttemptTime = None
                 return
             
+
+            if (targetType == putType and optionContractTargetStrike > targetStrikeByPosition) or (targetType == callType and optionContractTargetStrike < targetStrikeByPosition):
+                
+                if self.hasWarmedUp(2):
+                    self.app.addToActionLog("Contract out of strike range, next day")
+                    send_telegram_message(f"{targetType} Contract out of strike range, next day. found {optionContractTargetStrike}, target {targetStrikeByPosition}")
+                    self.goForNextDayOptionsData(daysToAdd=7)
+
+                    return "Try next day"
+
             midPrice = (optionContract.get("ask") + optionContract.get("bid")) / 2 if optionContract.get("ask") is not None and optionContract.get("bid") is not None else None
             
             if midPrice is None or midPrice < self.currentDteWheelMinPrice:
@@ -753,9 +773,15 @@ class ConfigAppScheduler(BaseAppScheduler):
             if self.orderApp.has_existing_order_contracts({f"short_{'put' if targetType == putType else 'call'}": optionContract}):
                 self.app.addToActionLog(f"Existing order found for {self.symbol} {targetType} at {targetPrice}, not placing duplicate order")
                 return
-            self.orderApp.place_single_contract_order(optionContract, orderRef="WheelTrade", action="SELL", quantity=amountOfContracts)
+            tp = None
+            if (self.daySteps != 0):
+                tp = max(math.floor(midPrice / 2 * 100) / 100, 0.05)
+            self.orderApp.place_single_contract_order(optionContract, orderRef="WheelTrade", action="SELL", quantity=amountOfContracts, mid=midPrice, tp=tp)
             sleep(0.5)
         else:
+            if optionContract is None:
+                return "No contract found that suits the search parameters"
+            
             if targetType == putType:
                 return {
                     "short_put": optionContract
@@ -764,7 +790,7 @@ class ConfigAppScheduler(BaseAppScheduler):
                 return {
                     "short_call": optionContract
                 }
-            return optionContract
+            return optionContract or "Contract not found"
         
     def checkLongPositionTakeProfit(self, requiredDistance=5, order=True):
         # check for existing stock position
@@ -821,7 +847,7 @@ class ConfigAppScheduler(BaseAppScheduler):
 
     def goForNextDayOptionsData(self, daysToAdd=1):
         if self.hasWarmedUp():
-            self.app.addToActionLog("Fetching next day options data")
+            self.app.addToActionLog(f"Fetching next {daysToAdd} days options data")
             self.app.cancel_all_options_market_data()
             try:
                 self.app.reset_options_data()
@@ -833,7 +859,7 @@ class ConfigAppScheduler(BaseAppScheduler):
                 self.app.fetch_next_day_options_data(daysToAdd)
             except Exception as error:
                 self.app.addToActionLog("error fetchiung next day")
-
+            self.daySteps += 1
 
     def load_config(self):
         """Load job configuration from JSON file, filtered by symbol."""

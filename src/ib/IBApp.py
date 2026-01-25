@@ -281,7 +281,7 @@ class IBApp(IBWrapper, IBClient):
         contract.exchange = "SMART"
         contract.secType = "OPT"
 
-        self.addToActionLog("Requesting market data for " + options_data["Symbol"] + " " + options_data["Type"] + " " + str(options_data["Strike"]))
+        # self.addToActionLog("Requesting market data for " + options_data["Symbol"] + " " + options_data["Type"] + " " + str(options_data["Strike"]))
 
         self.reqMktData(req, contract, "", False, False, [])
         time.sleep(0.1)  # To avoid pacing violations
@@ -994,41 +994,53 @@ class IBApp(IBWrapper, IBClient):
 
         return df.loc[valid_indices[nth_closest - 1]]
 
-    def get_by_delta_or_lower_by_dte(self, symbol, target_delta, minPrice, type="C"):
+    def get_by_delta_or_lower_by_dte(
+        self,
+        symbol,
+        target_delta,
+        min_price,
+        type="C",
+        target_underlying_price=None
+    ):
         df = self.filter_options_data(symbol, type)
 
-        if df.empty or not all(col in df.columns for col in ['delta', 'Strike', 'undPrice', 'Expiry', 'ask']):
+        required = ['delta', 'Strike', 'undPrice', 'Expiry', 'ask']
+        if df.empty or not all(col in df.columns for col in required):
             return None
 
-        # Convert to numeric types
-        delta = pd.to_numeric(df['delta'], errors='coerce')
-        strike = pd.to_numeric(df['Strike'], errors='coerce')
-        und_price = pd.to_numeric(df['undPrice'], errors='coerce')
-        ask = pd.to_numeric(df['ask'], errors='coerce')
-        expiry = pd.to_datetime(df['Expiry'], errors='coerce')
+        df = df.copy()
 
-        # Mask: abs(delta) <= target_delta and ask >= minPrice
-        mask = (delta.abs() <= abs(target_delta)) & (ask >= minPrice)
+        # Convert columns
+        df['delta'] = pd.to_numeric(df['delta'], errors='coerce')
+        df['ask'] = pd.to_numeric(df['ask'], errors='coerce')
+        df['Strike'] = pd.to_numeric(df['Strike'], errors='coerce')
+        df['Expiry'] = pd.to_datetime(df['Expiry'], format="%Y%m%d", errors='coerce')
+
+        # Base filter: delta + ask
+        mask = (df['delta'].abs() <= abs(target_delta)) & (df['ask'] >= min_price)
+
+        # Optional underlying-price constraint
+        if target_underlying_price is not None:
+            if type == "C":
+                mask &= df['Strike'] >= target_underlying_price
+            elif type == "P":
+                mask &= df['Strike'] <= target_underlying_price
+            # Any other type → ignore constraint
 
         # Compute DTE
         today = pd.Timestamp.today().normalize()
-        dte = (expiry - today).dt.days
+        df['DTE'] = (df['Expiry'] - today).dt.days
 
-        # Apply mask and filter valid expiries
-        valid = df[mask & (dte >= 0)].copy()
+        # Keep only valid expiries
+        valid = df[mask & (df['DTE'] >= 0)]
         if valid.empty:
             return None
 
-        valid['DTE'] = dte[mask & (dte >= 0)]
+        # Sort by DTE ascending, then ask descending
+        valid = valid.sort_values(['DTE', 'ask'], ascending=[True, False])
 
-        # Sort by DTE ascending, then by ask descending (or strike, depending on preference)
-        sorted_idx = valid.sort_values(['DTE']).index
+        return valid.iloc[0]
 
-        if len(sorted_idx) <= 0:
-            return None
-
-        # Return the first row (lowest DTE)
-        return valid.loc[sorted_idx[0]]
         
 
     
