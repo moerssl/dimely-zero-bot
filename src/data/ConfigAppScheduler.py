@@ -729,7 +729,7 @@ class ConfigAppScheduler(BaseAppScheduler):
                 Logger.log(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}")
                 if self.isWheelThresoldTimePassed():
                     send_telegram_message(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}, trying next day options data")
-                    self.goForNextDayOptionsData()
+                    self.goForNextDayOptionsData(daysToAdd=7)
                     self.firstWheelAttemptTime = None
                 return
             
