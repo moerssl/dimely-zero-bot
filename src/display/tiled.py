@@ -6,8 +6,6 @@ import datetime
 from time import sleep
 
 import pandas as pd
-import numpy as np
-import talib
 
 import schedule
 
@@ -336,3 +334,245 @@ def display_data_tiled(screen, app: IBApp, orderAdapter: TwsOrderAdapter, histor
             
         except Exception as e:
             app.addToActionLog(f"Error: {e}")
+
+
+import sys
+import io
+from collections import deque
+
+class OutputBuffer(io.StringIO):
+    def __init__(self, max_lines=1000):
+        super().__init__()
+        self.buffer = deque(maxlen=max_lines)
+        self.original_stdout = sys.stdout
+        self.enabled = True
+
+    def write(self, s):
+        # ✅ FIX: handle bytes
+        if isinstance(s, (bytes, bytearray)):
+            try:
+                s = s.decode("utf-8", errors="replace")
+            except Exception:
+                s = str(s)
+
+        # normalize to string
+        if not isinstance(s, str):
+            s = str(s)
+
+        # store lines
+        if s.strip():
+            for line in s.splitlines():
+                self.buffer.append(line)
+
+        # forward to real stdout if not capturing
+        if not self.enabled:
+            self.original_stdout.write(s)
+
+    def flush(self):
+        if not self.enabled:
+            self.original_stdout.flush()
+
+    def get_lines(self):
+        return list(self.buffer)
+
+    def clear(self):
+        self.buffer.clear()
+        
+
+
+def enter_curses(screen):
+    curses.noecho()
+    curses.cbreak()
+    curses.curs_set(0)
+    screen.keypad(True)
+
+def exit_curses(screen):
+    try:
+        screen.keypad(False)
+    except:
+        pass
+    curses.echo()
+    curses.nocbreak()
+    curses.curs_set(1)
+    curses.endwin()  # 🔥 restores terminal       
+ 
+import sys
+import msvcrt
+import time
+
+def wait_for_v_key():
+    while True:
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+
+            # handle bytes safely
+            try:
+                key = key.decode("utf-8").lower()
+            except:
+                continue
+
+            if key == 'v':
+                return
+
+        time.sleep(0.05)
+
+def display_data_tiled_switch(screen, app: IBApp, orderAdapter, historyAdapter, focusSymbol):
+    import curses
+    import schedule
+    import pandas as pd
+    import os
+
+    symbol, secType, exchange = focusSymbol
+
+    output_buffer = OutputBuffer()
+    sys.stdout = output_buffer
+
+    curses_mode = True
+    display_data = True
+
+    enter_curses(screen)
+
+    try:
+        while True:
+
+            schedule.run_pending()
+            data = app.getTilesData(symbol)
+            if curses_mode:
+
+                screen.clear()
+                height, width = screen.getmaxyx()
+
+                if display_data:
+
+                    num_tiles = len(data)
+                    num_columns = int(num_tiles ** 0.5) or 1
+
+                    rows = []
+                    current_row = []
+                    current_width = 0
+
+                    for tile in data:
+                        colspan = min(tile.get("colspan", 1), num_columns)
+
+                        if current_width + colspan > num_columns:
+                            rows.append(current_row)
+                            current_row = []
+                            current_width = 0
+
+                        tile["colspan"] = colspan
+                        current_row.append(tile)
+                        current_width += colspan
+
+                    if current_row:
+                        rows.append(current_row)
+
+                    num_rows = len(rows)
+                    tile_height = max(1, height // max(1, num_rows))
+                    tile_width_unit = max(1, width // num_columns)
+
+                    current_y = 0
+
+                    for row in rows:
+                        current_x = 0
+
+                        for tile in row:
+                            colspan = tile.get("colspan", 1)
+                            tile_width = tile_width_unit * colspan
+
+                            def safe_add(y, x, text, bold=False):
+                                try:
+                                    if bold:
+                                        screen.addstr(y, x, text[:tile_width-1], curses.A_BOLD)
+                                    else:
+                                        screen.addstr(y, x, text[:tile_width-1])
+                                except:
+                                    pass
+
+                            safe_add(current_y, current_x, tile["title"], True)
+
+                            content = tile["content"]
+
+                            if isinstance(content, list):
+                                for i, line in enumerate(content[:tile_height-1]):
+                                    safe_add(current_y+i+1, current_x, str(line))
+
+                            elif isinstance(content, dict):
+                                for i, (k, v) in enumerate(content.items()):
+                                    if i >= tile_height-1:
+                                        break
+                                    safe_add(current_y+i+1, current_x, f"{k}: {v}")
+
+                            elif hasattr(content, "columns"):
+                                df = content.head(tile_height-2)
+                                for i, line in enumerate(str(df).split("\n")):
+                                    if i >= tile_height-1:
+                                        break
+                                    safe_add(current_y+i+1, current_x, line)
+
+                            else:
+                                for i, line in enumerate(str(content).split("\n")):
+                                    if i >= tile_height-1:
+                                        break
+                                    safe_add(current_y+i+1, current_x, line)
+
+                            current_x += tile_width
+
+                        current_y += tile_height
+
+                else:
+                    df = app.options_data
+                    recent_data = df.tail(height - 2)
+
+                    for i, line in enumerate(str(recent_data).split("\n")):
+                        if i < height:
+                            try:
+                                screen.addstr(i, 0, line[:width])
+                            except:
+                                pass
+
+                # 🔥 show logs inside curses
+                log_lines = output_buffer.get_lines()[-5:]
+                for i, line in enumerate(log_lines):
+                    try:
+                        screen.addstr(height - len(log_lines) + i - 1, 0, line[:width-1])
+                    except:
+                        pass
+
+                screen.refresh()
+                key = screen.getch()
+
+                if key == 27:
+                    break
+
+                if key == ord('V'):
+                    curses_mode = False
+                    continue
+
+            else:
+                # 🔥 EXIT CURSES CLEANLY
+                exit_curses(screen)
+                output_buffer.enabled = False
+
+                print("\n========== LOG MODE (press V to return) ==========\n")
+
+                for line in output_buffer.get_lines():
+                    print(line)
+
+                output_buffer.clear()
+
+                # 🔥 wait for V safely
+                wait_for_v_key()
+
+                # 🔥 RE-ENTER CURSES CLEANLY
+                screen = curses.initscr()
+                enter_curses(screen)
+
+                output_buffer.enabled = True
+                curses_mode = True
+
+    finally:
+        sys.stdout = output_buffer.original_stdout
+        try:
+            exit_curses(screen)
+        except:
+            pass

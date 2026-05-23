@@ -1,23 +1,24 @@
 import ctypes
 import os
-import sys
 from time import sleep
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.events import EVENT_JOB_ERROR, JobExecutionEvent
 from ib.IBApp import IBApp
 from ib.TwsOrderAdapter import TwsOrderAdapter
-from data.CandlePredictor import CandlePredictor
+from ibapi.contract import Contract
 
 import pytz
-from datetime import datetime, timedelta
-from util.StrategyEnum import StrategyEnum
+from datetime import datetime, timedelta, date
 from util.time import inTzTime
 import pandas as pd
 
 import logging
 from util.Logger import Logger
+
+from util.TelegramMessenger import send_telegram_message
 
 # Get the APScheduler logger
 logging.getLogger('apscheduler').setLevel(logging.INFO)
@@ -29,8 +30,7 @@ class BaseAppScheduler:
         self.orderApp = orderApp
         self.historyApp = historyApp
         self.scheduler = BackgroundScheduler()        
-        self.all_predictions_df = None
-        self.ai_predictions = None
+
 
         self.symbol = symbol
         self.secondarySymbol = secondSymbol
@@ -44,13 +44,12 @@ class BaseAppScheduler:
         self.startTime = datetime.now()
         self.historySymbols = None
         self.minPrice = 0.2
-
-        df = pd.DataFrame()
-        if self.symbol in self.app.candleData:
-            df = self.app.candleData[self.symbol]
-        self.predictor: CandlePredictor = CandlePredictor(df)
+        
+        self.positionContractsRequestTime = None
+        self.optionPositionCloseDataRequested = False
         
         self.scheduler.add_listener(self.handleError, EVENT_JOB_ERROR)
+        self.itmOptions = set()
 
     def reset_start_time(self):
         self.startTime = datetime.now()
@@ -60,8 +59,9 @@ class BaseAppScheduler:
         Check if the scheduler has warmed up by comparing the current time with the start time.
         """
         warmUpTime = datetime.now() - self.startTime
-        return warmUpTime >= self.warmUpThreshold * multiplier
-    
+        pricesReceived = self.app.has_prices_received()
+        warmUpTimeReached = warmUpTime >= self.warmUpThreshold * multiplier
+        return pricesReceived or warmUpTimeReached
 
     def get_jobs_dataframe(self):
         """
@@ -111,7 +111,6 @@ class BaseAppScheduler:
                         self.shutdown()
                         return True
 
-
     def run(self):
         """
         Start the scheduler and add jobs for checkDeltaTrade and checkMultiEntryIconCondor.
@@ -123,12 +122,11 @@ class BaseAppScheduler:
         self.scheduler.add_job(func=self.catch_up, trigger=catch_up_trigger, id="catch_up")
 
         # cooldownTrigger = CronTrigger(second="34", minute="*/5", hour="9-15", timezone=self.ny_tz, start_date=delta_first_run, end_date=delta_last_run)
-        cooldownTrigger = IntervalTrigger(minutes=2)
+        start_time = datetime.now() + timedelta(seconds=30)
+        cooldownTrigger = IntervalTrigger(minutes=2, start_date=start_time)
+        
         self.scheduler.add_job(self.cooldown, trigger=cooldownTrigger, id="cooldown", misfire_grace_time=15)
 
-        predictionsTrigger = IntervalTrigger(seconds=30)
-        self.scheduler.add_job(self.predict, trigger=predictionsTrigger, id="predict", misfire_grace_time=15)
-        # Start the scheduler.
         self.scheduler.start()
 
         self.checkShutdownJob()
@@ -141,72 +139,69 @@ class BaseAppScheduler:
         self.orderApp.reqAllOpenOrders()
         sleep(0.5)
 
-    def predict(self):
-        """
-        Predict the next candle using the CandlePredicter and log the result.
-        """
-        
-        if self.hasWarmedUp():
-            df = pd.DataFrame()
-            if self.symbol in self.app.candleData:
-                df = self.app.candleData[self.symbol]
-            else:
-                return
-            try:
-                self.predictor.update_dataframe(df, "replace")
-                if (self.predictor.ai_model is None or 
-                    not hasattr(self.predictor.ai_model, "estimators_")) and len(df) > 0:
-                    self.app.addToActionLog("Train")
-
-                    self.predictor.train_ai_model()
-                else:
-                    self.app.addToActionLog("Predicting")
-                    self.ai_predictions = self.predictor.predict_day_extremes_ai()
-                    self.all_predictions_df = self.predictor.predict_all_candles_ai()
-                    self.predictor.evaluate_and_adjust_model()
-                    self.predictor.save_model()
-
-            except Exception as e:
-                self.app.addToActionLog("Error in predict: " + str(e))
-        elif (self.predictor.ai_model is None):
-            try:
-                self.app.addToActionLog("Loading model")
-                self.predictor.load_model()
-            except Exception as e:
-                self.app.addToActionLog("Error in load_model: " + str(e))
-
-
-
-    def printPredictions(self):
-        return self.ai_predictions 
-    
-    def printEnhancedPredictions(self):
-        # latest first, only chosen columns
-        try:
-            df = None
-            if self.all_predictions_df is not None:
-
-                df = self.all_predictions_df[["datetime", 
-                                            "open", 
-                                            "high", 
-                                            "low", 
-                                            "close", 
-                                            "remaining_day_high", 
-                                            "remaining_day_low"
-                                            ]]
-                df = df.sort_values(by="datetime", ascending=False)
-                df = df.reset_index(drop=True)
-            return df
-        except Exception as e:
-            self.app.addToActionLog("Error in printEnhancedPredictions: " + str(e))
-            return None
-
-
     def print_stock_positions(self):
         stock_position = self.orderApp.getStockPositionsForSymbol(self.symbol)
         if stock_position is not None:
             return stock_position
         return "No stock position found for " + self.symbol
+    
+    def calculate_dte(self, date_string):
+        # Convert string 'YYYYMMDD' to a date object
+        target_date = datetime.strptime(date_string, "%Y%m%d").date()
+        
+        # Get today's date
+        today = date.today()
+        
+        # Subtract the dates to get a timedelta object
+        delta = target_date - today
+        
+        # Return the number of days
+        return delta.days   
+
+        
+    def print_short_option_itm_check(self):
+        shortPositions = self.orderApp.getOptionPositionsForSymbol(self.symbol)
+        underlyingPrice = self.app.getPriceForSymbol(self.symbol)
+        contractPositions = []
+        
+        for pos in shortPositions:
+            contract: Contract = pos["contract"]
+            con_id = contract.conId
+            
+            dte = self.calculate_dte(contract.lastTradeDateOrContractMonth)
+            dictContract = {                
+                "Symbol": contract.symbol,
+                "Contracts": pos["position"],
+                "Type": contract.right,
+                "DTE": dte,
+                "Strike": round(contract.strike,2),                
+                "Price": underlyingPrice,
+            }
+            
+            if underlyingPrice:
+                is_currently_itm = underlyingPrice < contract.strike if contract.right == "P" else underlyingPrice > contract.strike
+                dictContract["ITM"] = is_currently_itm
+                dictContract["room"] = round(underlyingPrice - contract.strike,2) if contract.right == "P" else round(contract.strike - underlyingPrice,2)
+
+                option_desc = f"{contract.symbol} {contract.strike}{contract.right} (Exp: {contract.lastTradeDateOrContractMonth})"
+                
+                if is_currently_itm and con_id not in self.itmOptions:
+                    # Transition: OTM -> ITM
+                    self.itmOptions.add(con_id)
+                    send_telegram_message(f"🚨 ALERT: {option_desc} moved IN-THE-MONEY (ITM).")
+                    
+                elif not is_currently_itm and con_id in self.itmOptions:
+                    # Transition: ITM -> OTM
+                    self.itmOptions.remove(con_id)
+                    send_telegram_message(f"✅ RELIEF: {option_desc} is now OUT-OF-THE-MONEY (OTM).")
+            
+            contractPositions.append(dictContract)
+        df = pd.DataFrame(contractPositions)
+        if df.empty:
+            return df
+        else:
+            return df.sort_values("Strike", ascending=False)
+    
     
     def checkDeltaTradeForSymbol(self, symbol, delta=0.25, wing_span=1, tp_percentage=None, sl_percentage=None, touch=None, minPrice=0.2):
         self.app.addToActionLog("CHECKING DELTA TRADE "+ symbol)        
@@ -242,7 +237,10 @@ class BaseAppScheduler:
     def cooldown(self):
         Logger.log("Cancelling option market data")
         self.app.addToActionLog("Cancelling option market data")
-        self.app.cancel_all_options_market_data()
+        try:
+            self.app.cancel_all_options_market_data()
+        except Exception as e:
+            Logger.log(str(e))
         sleep(5)
         Logger.log("Request market data")
         self.app.addToActionLog("Request market data")
@@ -273,7 +271,6 @@ class BaseAppScheduler:
             # WM_CLOSE == 0x0010
             ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
 
-    
     def handleError(self, event: JobExecutionEvent):
         try:
             if event.exception:
@@ -296,3 +293,26 @@ class BaseAppScheduler:
                 Logger.log(error_msg)
         except Exception as e:
             self.app.addToActionLog(f"⚠️ Error in error handler: {e}")
+
+    def goForNextDayOptionsData(self, daysToAdd=1, reset=True):
+        if self.hasWarmedUp():
+            self.app.addToActionLog(f"Fetching next {daysToAdd} days options data")
+            self.reset_start_time()
+            
+            target_date = datetime.today() + timedelta(days=daysToAdd)
+            # 1. Reset erst NACHDEM neue ContractDetails angekommen sind
+            self.app.contractDetailsPending = True
+            
+            if reset:
+                self.app.cancel_all_options_market_data()
+                try:
+                    self.app.reset_options_data()
+                except Exception as error:
+                    self.app.addToActionLog("Error resetting optionbs data")
+            
+            
+            try:
+                self.app.fetch_next_days_options_data(daysToAdd)
+            except Exception as error:
+                self.app.addToActionLog("error fetchiung next day")
+            self.daySteps += 1

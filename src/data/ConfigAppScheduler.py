@@ -1,7 +1,11 @@
 import copy
+from decimal import Decimal
 from functools import partial
 import math
 from time import sleep
+import time
+
+import pandas as pd
 from data.OrbResult import OrbResult
 from data.BaseAppScheduler import BaseAppScheduler
 from ib.TwsOrderAdapter import TwsOrderAdapter
@@ -12,9 +16,57 @@ from apscheduler.triggers.combining import OrTrigger
 import json
 import inspect
 from util.Logger import Logger
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from util.TelegramMessenger import send_telegram_message
+
+
+ 
+
+def build_options_summary(df):
+    # Helper: safe column check
+    def has(col):
+        return col in df.columns
+
+    total_rows = len(df)
+
+    bid_rows = df[df["bid"] > 0].shape[0] if has("bid") else None
+    ask_rows = df[df["ask"] > 0].shape[0] if has("ask") else None
+
+    # Rows where both bid and ask > 0
+    if has("bid") and has("ask"):
+        both_mask = (df["bid"] > 0) & (df["ask"] > 0)
+        both_rows = df[both_mask].shape[0]
+    else:
+        both_mask = None
+        both_rows = None
+
+    # DTE range
+    min_dte = df["DTE"].min() if has("DTE") else None
+    max_dte = df["DTE"].max() if has("DTE") else None
+
+    # Strike range for rows where bid & ask > 0
+    if both_mask is not None and has("Strike"):
+        valid_strikes = df.loc[both_mask, "Strike"]
+        min_strike = valid_strikes.min() if not valid_strikes.empty else None
+        max_strike = valid_strikes.max() if not valid_strikes.empty else None
+    else:
+        min_strike = None
+        max_strike = None
+
+    summary = (
+        f"rows={total_rows}, "
+        f"bid>0={bid_rows}, "
+        f"ask>0={ask_rows}, "
+        f"bid&ask>0={both_rows}, "
+        f"minDTE={min_dte}, "
+        f"maxDTE={max_dte}, "
+        f"minStrike_bid&ask>0={min_strike}, "
+        f"maxStrike_bid&ask>0={max_strike}"
+    )
+
+    return summary
+
 
 
 class ConfigAppScheduler(BaseAppScheduler):
@@ -249,18 +301,7 @@ class ConfigAppScheduler(BaseAppScheduler):
                 Logger.log(str(e))
 
 
-                    
-
-            
-            
-
-        if callLegs is None or putLegs is None:
-            
-            if order:
-                send_telegram_message(f"No valid legs found for Delta Iron Condor trade for {self.symbol}")
-            return
-
-        icLegs = {**callLegs, **putLegs}
+        icLegs = {**(callLegs or {}), **(putLegs or {})}
 
         if not order:
             return icLegs
@@ -659,7 +700,13 @@ class ConfigAppScheduler(BaseAppScheduler):
             if self.orderApp.has_existing_order_contracts({f"short_{'put' if targetType == putType else 'call'}": optionContract}):
                 self.app.addToActionLog(f"Existing order found for {self.symbol} {targetType} at {targetPrice}, not placing duplicate order")
                 return
-            self.orderApp.place_single_contract_order(optionContract, orderRef="WheelTrade", action="SELL", quantity=amountOfContracts)
+            tp = None
+            dte = optionContract.get("DTE", None)
+            if (dte is not None and midPrice > 2 * xDteMinPrice):
+                tp = math.floor(midPrice / 2)
+                tp = max(tp, 0.05)
+                
+            self.orderApp.place_single_contract_order(optionContract, orderRef="WheelTrade", action="SELL", quantity=amountOfContracts, tp=tp)
             sleep(0.5)
         else:
             if targetType == putType:
@@ -672,7 +719,200 @@ class ConfigAppScheduler(BaseAppScheduler):
                 }
             return optionContract
 
+        
+    def check_and_place_wheel_trade(
+        self,
+        distance: float = 0.2,
+        zeroDteMinPrice: float = 0.2,
+        xDteMinPrice: float = 0.25,
+        target_delta: float = 0.3,
+        order: bool = True,
+        next_day_days: int = 7,
+        max_attempts_before_escalation: int = 3
+    ):
+        """
+        - Exit immediately if there is no stock position (None or 0 shares).
+        - Detect long (shares > 0) or short (shares < 0) and decide to sell CALLs (long) or PUTs (short).
+        - Search for an option via get_by_delta_or_lower_by_dte.
+        - If no option matches, escalate by requesting next-day options data and increase min-price threshold.
+        - If an option is found, compute a robust midPrice (ask/bid/last fallback) and place a SELL order if criteria met.
+        - Uses self.orderApp, self.app, Logger, send_telegram_message, and self.goForNextDayOptionsData as in your codebase.
+        """
 
+        putType = "P"
+        callType = "C"
+
+        # --- 1) Get and validate stock position (exit if none or zero) ---
+        stock_position = self.orderApp.getStockPositionsForSymbol(self.symbol)
+        if not stock_position:
+            self.app.addToActionLog(f"No stock position found for {self.symbol}; exiting Wheel Trade")
+            return "No stock position found"
+
+        amountOfShares = int(stock_position.get("position", 0) or 0)
+        if amountOfShares == 0:
+            self.app.addToActionLog(f"No stock position (0 shares) for {self.symbol}; exiting Wheel Trade")
+            return "No stock position found"
+
+        # --- 2) Setup and decide target type/strike ---
+        targetStrikeByPosition = stock_position.get("avgCost", None)
+        underlyingPrice = self.app.checkUnderlyingOptions(self.symbol).get("price", None)
+
+        if targetStrikeByPosition is None or underlyingPrice is None:
+            self.app.addToActionLog(f"Missing price data for {self.symbol}: underlying={underlyingPrice}, avgCost={targetStrikeByPosition}")
+            return "Missing price data"
+
+        # Decide whether to sell puts (cover short) or calls (cover long)
+        if amountOfShares < 0:
+            # short stock position -> consider selling puts (to collect premium / roll)
+            targetType = putType
+            targetPrice = math.floor(targetStrikeByPosition)
+        else:
+            # long stock position -> consider selling calls (covered calls)
+            targetType = callType
+            targetPrice = math.ceil(targetStrikeByPosition)
+
+        # Ensure min-price state exists
+        if self.currentDteWheelMinPrice is None:
+            self.currentDteWheelMinPrice = zeroDteMinPrice
+
+        # --- 3) Attempt to find an option contract ---
+        self.app.optionMarketDataRequestTargetStrike = targetPrice
+        optionContract = self.app.get_by_delta_or_lower_by_dte(
+            self.symbol,
+            target_delta,
+            self.currentDteWheelMinPrice,
+            targetType,
+            target_underlying_price=targetPrice
+        )
+        
+        if optionContract is None:
+            self.app.request_closest_strike(self.symbol, targetPrice, targetType)
+            optionContract = self.app.find_closest_strike_by_dte(df=self.app.options_data, symbol=self.symbol, strike=targetPrice, option_type=targetType)
+
+        # Normalize optionContract to dict if it's a pandas Series/row
+        if optionContract is not None and hasattr(optionContract, "to_dict"):
+            self.app.request_options_market_data(optionContract)
+            optionContract = optionContract.to_dict()
+
+        # --- 4) If no option found -> escalate (request next-day options) ---
+        if optionContract is None:
+            # increment attempt counter (create if missing)
+            self.wheel_attempts = getattr(self, "wheel_attempts", 0) + 1
+            self.app.addToActionLog(f"No option contract found for {self.symbol} {targetType} at {targetPrice} (attempt {self.wheel_attempts})")
+            Logger.log(f"No option contract found for {self.symbol} {targetType} at {targetPrice} (attempt {self.wheel_attempts})")
+
+            # If we've tried enough times, escalate to next-day options and raise min price
+            if self.wheel_attempts >= max_attempts_before_escalation or self.isWheelThresoldTimePassed():
+                if not self.orderApp.hasOptionPositionsForSymbol(self.symbol):
+                    if order:
+                        send_telegram_message(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}, requesting next-day options")
+                        # raise the min price for xDTE attempts
+                        self.currentDteWheelMinPrice = xDteMinPrice
+                        self.goForNextDayOptionsData(daysToAdd=next_day_days, reset=True)
+                        self.wheel_attempts = 0
+                        self.firstWheelAttemptTime = None
+                    return "Request next-day options data"
+            return "No contract found that suits the search parameters"
+
+        # Reset attempts on success
+        self.wheel_attempts = 0
+
+        # --- 5) Validate strike relation (avoid selling OTM in wrong direction) ---
+        optionStrike = optionContract.get("Strike")
+        if optionStrike is None:
+            Logger.log(f"Option strike missing for {self.symbol} contract; skipping strike-range check")
+        else:
+            if (targetType == putType and optionStrike > targetStrikeByPosition) or (targetType == callType and optionStrike < targetStrikeByPosition):
+                # Contract is on the wrong side of the position; escalate to next-day options
+                self.app.addToActionLog("Contract out of strike range, requesting next-day options")
+                send_telegram_message(f"{self.symbol} {targetType} contract out of strike range: found {optionStrike}, target {targetStrikeByPosition}")
+                if not self.orderApp.hasOptionPositionsForSymbol(self.symbol) and order:
+                    self.goForNextDayOptionsData(daysToAdd=next_day_days, reset=True)
+                    return "Contract out of strike range; requested next-day options"
+
+        # --- 6) Compute robust midPrice (ask/bid/last fallback) ---
+        ask = optionContract.get("ask")
+        bid = optionContract.get("bid")
+        last = optionContract.get("last")
+        if ask is not None and bid is not None:
+            midPrice = (ask + bid) / 2.0
+        elif ask is not None:
+            midPrice = ask
+        elif bid is not None:
+            midPrice = bid
+        elif last is not None:
+            midPrice = last
+        else:
+            midPrice = None
+
+        if midPrice is None or midPrice < self.currentDteWheelMinPrice or not midPrice > 0:
+            self.app.addToActionLog(f"Mid price too low for {self.symbol} {targetType} at {targetPrice}: {midPrice}")
+
+            # escalate to next-day options if threshold/time/attempts reached
+            self.wheel_attempts = getattr(self, "wheel_attempts", 0) + 1
+            if self.wheel_attempts >= max_attempts_before_escalation or self.isWheelThresoldTimePassed():
+                if order and not self.orderApp.hasOptionPositionsForSymbol(self.symbol):
+                    send_telegram_message(f"Mid price too low for {self.symbol} {targetType} at {targetPrice}: {midPrice}. Requesting next-day options.")
+                    self.currentDteWheelMinPrice = xDteMinPrice
+                    self.goForNextDayOptionsData(daysToAdd=next_day_days, reset=True)
+                    self.wheel_attempts = 0
+                    self.firstWheelAttemptTime = None
+                    return "Request next-day options due to low price"
+            return self.toReturnDict(optionContract, targetType)
+
+
+        # --- 7) Ensure we have contracts to sell (quantity) ---
+        amountOfContracts = abs(amountOfShares) // 100
+        if amountOfContracts <= 0:
+            self.app.addToActionLog(f"Insufficient shares to create option contracts for {self.symbol} (shares={amountOfShares})")
+            return "Insufficient contracts"
+
+        # --- 8) Check for existing positions or duplicate orders ---
+        if self.orderApp.hasPositionsForSymbol(self.symbol, targetType):
+            self.app.addToActionLog(f"Existing option position found for {self.symbol} {targetType}; not placing new order")
+            return "Existing option position present"
+
+        short_key = f"short_{'put' if targetType == putType else 'call'}"
+        if self.orderApp.has_existing_order_contracts({short_key: optionContract}):
+            self.app.addToActionLog(f"Existing order found for {self.symbol} {targetType} at {optionStrike}; skipping duplicate")
+            return "Duplicate order exists"
+
+        # --- 9) Place order (if requested) ---
+        if order:
+            if not self.hasWarmedUp():
+                self.app.addToActionLog("Awaiting warmup for Wheel Trade")
+                return "Awaiting warmup"
+            
+            if not midPrice > 0:
+                return 
+
+            # compute take-profit (tp) if daySteps configured
+            tp = None
+            if getattr(self, "daySteps", 0) != 0:
+                tp = max(math.floor(midPrice / 2 * 100) / 100, 0.05)
+
+            self.app.addToActionLog(f"Placing Wheel Trade SELL order for {self.symbol} {targetType} strike {optionStrike} qty {amountOfContracts} mid {midPrice}")
+            self.orderApp.place_single_contract_order(
+                optionContract,
+                orderRef="WheelTrade",
+                action="SELL",
+                quantity=amountOfContracts,
+                mid=midPrice,
+                tp=tp
+            )
+            time.sleep(0.5)
+            return "Order placed"
+
+        # --- 10) If not ordering, return the contract info for inspection ---
+        return self.toReturnDict(optionContract, targetType)
+
+    def toReturnDict(self, optionContract, targetType):
+        putType = "P"
+        callType = "C"
+        if targetType == putType:
+            return {"short_put": optionContract}
+        else:
+            return {"short_call": optionContract}
 
     def checkDeltaWheelTrade(self, distance=0.2, zeroDteMinPrice=0.2, xDteMinPrice=0.25, order=True):
         putType = "P"
@@ -706,6 +946,7 @@ class ConfigAppScheduler(BaseAppScheduler):
             targetType = callType
             targetPrice = math.ceil(targetStrikeByPosition)
         
+        self.app.optionMarketDataRequestTargetStrike = targetPrice
         optionContract = self.app.get_by_delta_or_lower_by_dte(self.symbol, 0.3, self.currentDteWheelMinPrice, targetType, target_underlying_price=targetPrice)
         optionContractTargetStrike = None
         if optionContract is not None:
@@ -716,32 +957,43 @@ class ConfigAppScheduler(BaseAppScheduler):
         if targetType == callType and optionContractTargetStrike < targetStrikeByPosition:
         """
         if order:
+            if self.app.contractDetailsPending:
+                self.app.addToActionLog("Contract Details Pending")
+                return "Contract Details Pending"
+            
+            summary = build_options_summary(self.app.options_data)
+            runningRequests = f"{len(self.app.option_id_req)} options_id_req | {len(self.app.market_data_req_ids)} market_data_req_ids"
+            self.app.addToActionLog(runningRequests)
+            self.app.addToActionLog(summary)
             
             if not self.hasWarmedUp():
                 self.app.addToActionLog("Awaiting warmup for Wheel Trade")
-                return
+                return "Awaiting warmup for Wheel Trade"
             
             if self.firstWheelAttemptTime is None:
                 self.firstWheelAttemptTime = datetime.now()
            
             if optionContract is None:
-                self.app.addToActionLog("No valid option contract found for Wheel Trade")
+                self.app.addToActionLog(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}")
+                
                 Logger.log(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}")
-                if self.isWheelThresoldTimePassed():
-                    send_telegram_message(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}, trying next day options data")
-                    self.goForNextDayOptionsData(daysToAdd=7)
-                    self.firstWheelAttemptTime = None
+                if self.isWheelThresoldTimePassed(1):
+                    if not self.orderApp.hasOptionPositionsForSymbol(self.symbol):
+                        send_telegram_message(f"No valid option contract found for {self.symbol} {targetType} at {targetPrice}, trying next day options data")
+                        self.goForNextDayOptionsData(daysToAdd=7, reset=True)
+                        self.firstWheelAttemptTime = None
                 return
             
 
             if (targetType == putType and optionContractTargetStrike > targetStrikeByPosition) or (targetType == callType and optionContractTargetStrike < targetStrikeByPosition):
                 
-                if self.hasWarmedUp(2):
+                if self.hasWarmedUp(0.5):
                     self.app.addToActionLog("Contract out of strike range, next day")
                     send_telegram_message(f"{targetType} Contract out of strike range, next day. found {optionContractTargetStrike}, target {targetStrikeByPosition}")
-                    self.goForNextDayOptionsData(daysToAdd=7)
+                    if not self.orderApp.hasOptionPositionsForSymbol(self.symbol):
+                        self.goForNextDayOptionsData(daysToAdd=7, reset=True)
 
-                    return "Try next day"
+                        return "Try next day"
 
             midPrice = (optionContract.get("ask") + optionContract.get("bid")) / 2 if optionContract.get("ask") is not None and optionContract.get("bid") is not None else None
             
@@ -753,12 +1005,15 @@ class ConfigAppScheduler(BaseAppScheduler):
                     # when no valid price is found within 5 minutes, try next day options data
                     
                     if self.isWheelThresoldTimePassed():
-                        self.app.addToActionLog("No valid price found for Wheel Trade within 15 minutes, fetching next day options data")
-                        send_telegram_message(f"Mid price for {self.symbol} {targetType} at {targetPrice} is too low: {midPrice}, trying next day options data")
-                        self.currentDteWheelMinPrice = xDteMinPrice
+                        if not self.orderApp.hasOptionPositionsForSymbol(self.symbol):
+                        
+                            
+                            self.app.addToActionLog("No valid price found for Wheel Trade within 15 minutes, fetching next day options data")
+                            send_telegram_message(f"Mid price for {self.symbol} {targetType} at {targetPrice} is too low: {midPrice}, trying next day options data")
+                            self.currentDteWheelMinPrice = xDteMinPrice
 
-                        self.goForNextDayOptionsData(7)
-                        self.firstWheelAttemptTime = None
+                            self.goForNextDayOptionsData(7, reset=True)
+                            self.firstWheelAttemptTime = None
                 except Exception as e:
                     Logger.log(f"Error while checking time for next day options data fetch: {e}")
 
@@ -782,6 +1037,7 @@ class ConfigAppScheduler(BaseAppScheduler):
             if optionContract is None:
                 return "No contract found that suits the search parameters"
             
+            
             if targetType == putType:
                 return {
                     "short_put": optionContract
@@ -792,74 +1048,81 @@ class ConfigAppScheduler(BaseAppScheduler):
                 }
             return optionContract or "Contract not found"
         
-    def checkLongPositionTakeProfit(self, requiredDistance=5, order=True):
+   
+    def checkLongPositionTakeProfit(self, requiredDistance=0.005, displayAmountShares=-100, displayCostBasis=247.34, order=True):
         # check for existing stock position
         stock_position = self.orderApp.getStockPositionsForSymbol(self.symbol)
+        hint = ""
         if stock_position is None:
-            return "No stock position"
+            hint = "No stock position"
+            if order:
+                return hint
+            
+            dictContract = {
+                self.symbol: self.symbol
+            }
+            amountOfShares = displayAmountShares
+            costBasis = displayCostBasis
+        else:
+            contract: Contract = stock_position["contract"]
+            dictContract = {
+                "ConId": contract.conId,
+                "Symbol": contract.symbol            
+            }
         
-        amountOfShares = stock_position.get("position", 0)
-        targetStrikeByPosition = stock_position.get("avgCost", None)
+            amountOfShares = float(stock_position.get("position", 0))
+            costBasis = stock_position.get("avgCost", None)
         # underlyingPrice = self.app.checkUnderlyingOptions(self.symbol).get("price", 0)
         underlyingPrice = self.app.getPriceForSymbol(self.symbol)
 
         closingAction = "SELL"
+        quantity = abs(amountOfShares)
         if amountOfShares < 0:
-            return "Less shares"
+            closingAction = "BUY"
 
-        if not targetStrikeByPosition:
+        if not costBasis:
             return "no avg price"
         
         if not underlyingPrice:
             return "no underlyng price"
         
-        contract: Contract = stock_position["contract"]
-        dictContract = {
-            "ConId": contract.conId,
-            "Symbol": contract.symbol            
-        }
-        currentDistance = underlyingPrice - targetStrikeByPosition
+
+        if amountOfShares > 0:
+            # having shares, sell call
+            currentDistance = underlyingPrice - costBasis 
+        
+        else:
+            # short shares, sell put
+            currentDistance = costBasis - underlyingPrice
+        currentDistancePercent = currentDistance / underlyingPrice
+        pnl = (underlyingPrice - costBasis) * amountOfShares
+        doClosePosition = currentDistancePercent > requiredDistance
+        
         if order:
-            if not self.hasWarmedUp():
-                self.app.addToActionLog("Awaiting warmup for checkLongPositionTakeProfit")
-                return
             if self.orderApp.has_existing_order_contracts({"stock": dictContract}):
                 return
             
             if (self.orderApp.hasOptionPositionsForSymbol(contract.symbol)):
                 self.app.addToActionLog(f"Existing option positions found for {contract.symbol}, not placing order")
                 return
-            if currentDistance < requiredDistance:
+            if not doClosePosition:
                 self.app.addToActionLog(f"Required distance for {contract.symbol} not met, not placing stock order")
                 return 
-            self.orderApp.place_single_contract_order(dictContract, orderRef="LongPositionTakeProfit", action=closingAction, quantity=amountOfShares, mid=underlyingPrice, doTransmit=False)
+            self.orderApp.place_single_contract_order(dictContract, orderRef="PositionTakeProfit", action=closingAction, quantity=quantity, mid=underlyingPrice, doTransmit=True, outsideRTH=True)
         else:
             dictContract["mid"] = underlyingPrice
             dictContract["bid"] = underlyingPrice
             dictContract["ask"] = underlyingPrice
-            dictContract["currentDistance"] = currentDistance
+            dictContract["currentDistance"] = round(currentDistance,2)
+            dictContract["cdP"] = round(currentDistancePercent*100,2)
             dictContract["reqDistance"] = requiredDistance
-            dictContract["closePosition"] =  currentDistance > requiredDistance
+            dictContract["pnl"] = round(pnl)
+            dictContract["closePosition"] =  doClosePosition
+            
+            dictContract["hint"] = hint
             return  {
                 "long_stock":dictContract
             }
-
-
-    def goForNextDayOptionsData(self, daysToAdd=1):
-        if self.hasWarmedUp():
-            self.app.addToActionLog(f"Fetching next {daysToAdd} days options data")
-            self.app.cancel_all_options_market_data()
-            try:
-                self.app.reset_options_data()
-                self.reset_start_time()
-            except Exception as error:
-                self.app.addToActionLog("Error resetting optionbs data")
-            try:
-
-                self.app.fetch_next_day_options_data(daysToAdd)
-            except Exception as error:
-                self.app.addToActionLog("error fetchiung next day")
-            self.daySteps += 1
 
     def load_config(self):
         """Load job configuration from JSON file, filtered by symbol."""
@@ -906,5 +1169,111 @@ class ConfigAppScheduler(BaseAppScheduler):
     
     def isWheelThresoldTimePassed(self, minutes=2):
         minutesInSeconds = 60 * minutes
+        if self.firstWheelAttemptTime is None:
+            self.firstWheelAttemptTime = datetime.now()
         return (datetime.now() - self.firstWheelAttemptTime).total_seconds() > minutesInSeconds
+    
+    def checkOptionPositionProfit(self, order=True, job_id=None):
+      try:    
+        positions = self.orderApp.getOptionPositionsForSymbol(self.symbol)
+        contractPositions = []
+        
+        for pos in positions:
+            shares = pos["position"]
+            if shares == 0:
+                continue
+
+            contract: Contract = pos["contract"]
+            multiplier = float(contract.multiplier)
+            costBasis = float(pos.get("avgCost")) / multiplier 
+            
+            if costBasis < self.minPrice * 2 and len(positions) == 1:
+                
+                #if order:
+                #    jobs = self.scheduler.get_jobs()
+                #    if job_id in jobs:
+                #        self.scheduler.remove_job(job_id=job_id)
+                return "Skip take option profit. costbase too low"
+            
+            marketData = self.app.find_single_contract_by_id(contract.conId)
+            bid = None
+            ask = None
+            pnl = None
+            dte = self.calculate_dte(contract.lastTradeDateOrContractMonth)
+            close = False
+            should_close = False
+            if marketData is not None:
+
+                bid = marketData.get("bid")
+                ask = marketData.get("ask")
+                try:
+                    if order:
+                        self.app.request_options_market_data(marketData)
+                except Exception as e:
+                    self.app.addToActionLog(str(e))
+            
+                # --- Directional Logic Block ---
+                orderAction = None
+                if shares > 0:
+                    if bid > 0:
+                        # LONG POSITION logic
+                        # We exit at the Bid (what buyers are offering)
+                        pnl = (bid - costBasis) * multiplier * shares if bid else None
+                        close = (bid >= costBasis * 1.5) if bid else False
+                        orderAction = "SELL"
+
+                else:
+                    if ask > 0:
+                        # SHORT POSITION logic
+                        # We exit at the Ask (what sellers are demanding)
+                        # We use abs(shares) to keep the PnL positive when in profit
+                        orderAction = "BUY"
+                        pnl = (costBasis - ask) * multiplier * float(abs(shares)) if ask else None
+                        close = (ask <= costBasis * 0.5 and costBasis >= self.minPrice * 2) if ask else False
+                # -------------------------------
+
+                # Final safety: Only close if there's time left and we found a price
+                should_close = close and dte > 0 and len(positions) == 1
+                if should_close and order:
+                    if (not self.orderApp.has_existing_order_contracts({"op": marketData})):
+                        self.orderApp.place_single_contract_order(marketData, orderAction, abs(shares), orderRef="wheelOptionTakeProfit", doTransmit=True)
+                        if not self.optionPositionCloseDataRequested:
+                            self.optionPositionCloseDataRequested = True
+                            send_telegram_message(f"Requesting more options data for existing position")
+                            self.goForNextDayOptionsData(daysToAdd=7, reset=True)
+            else:
+                try:
+                    if self.positionContractsRequestTime is None or datetime.now() - self.positionContractsRequestTime  > timedelta(minutes=2):
+                        self.positionContractsRequestTime = datetime.now()
+                        req = self.app.nextReqId()                
+                        self.app.reqContractDetails(req, contract)
+
+                except Exception as e:
+                    self.app.addToActionLog(str(e))
+                
+            dictContract = {  
+                "job": job_id,              
+                "Symbol": contract.symbol,
+                "Contracts": shares,
+                "Type": contract.right,
+                "DTE": dte,
+                "Strike": round(contract.strike, 2),  
+                "pnl": pnl, 
+                "costBasis": costBasis,
+                "bid": bid,
+                "ask": ask,
+                "close": should_close
+            }
+            
+            contractPositions.append(dictContract)
+        df = pd.DataFrame(contractPositions)
+        if df.empty:
+            if order:
+                self.app.reqPositions()
+            return df
+        else:
+            return df.sort_values("Strike", ascending=False)
+      except Exception as e:
+          self.app.addToActionLog(e)
+ 
     

@@ -1,45 +1,33 @@
+import math
 import os
-from typing import List, Tuple
-import numpy as np
-from data.OrbResult import OrbResult
-from ib.IBWrapper import IBWrapper
-from ib.IbQueueWrapper import IbQueueWrapper
-from ib.IBClient import IBClient
-from ibapi.contract import Contract
-from ibapi.order import Order
-from ibapi.contract import Contract, ComboLeg
-from ibapi.order import Order
-from ibapi.order_condition import OrderCondition, PriceCondition
-from ibapi.order_state import OrderState
-
-from ibapi.utils import iswrapper
-from ibapi.common import *
-import pandas as pd
 import time
-from datetime import datetime, timedelta
-from logging import getLogger
-from threading import Thread, Condition, RLock
-
-from sklearn.linear_model import LinearRegression  
-import joblib
-import talib
-import scipy.stats as stats
-from scipy.stats import norm
-from util.Chart import Chart
-from util.Logger import Logger
-from util.StrategyEnum import StrategyEnum
-from util.AdaptiveDataframeProcessor import AdaptiveDataframeProcessor
-import util.TaAnalysisHelper as tah
-from util.TelegramMessenger import send_telegram_message
-from util.config import CONFIG
-from ib.TwsOrderAdapter import TwsOrderAdapter
-from data.ExpectedValueTrader import ExpectedValueTrader
-
+import traceback
 from datetime import datetime, timedelta
 from datetime import timezone as dttimezone
+from logging import getLogger
+from threading import RLock
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+from ibapi.common import *
+from ibapi.contract import Contract
+from ibapi.order import Order
+from ibapi.order_state import OrderState
+from ibapi.utils import iswrapper
 from pytz import timezone
-import math
-import traceback
+
+import util.TaAnalysisHelper as tah
+from data.ExpectedValueTrader import ExpectedValueTrader
+from data.OrbResult import OrbResult
+from ib.IBClient import IBClient
+from ib.IBWrapper import IBWrapper
+from ib.TwsOrderAdapter import TwsOrderAdapter
+from util.Chart import Chart
+from util.config import CONFIG
+from util.Logger import Logger
+from util.StrategyEnum import StrategyEnum
+from util.TelegramMessenger import send_telegram_message
 
 logger = getLogger(__name__)
 # logger.setLevel("INFO")
@@ -65,6 +53,7 @@ class IBApp(IBWrapper, IBClient):
         self.apiOrderLock = RLock()
         self.candleLock = RLock()
         self.actionLock = RLock()
+        self._market_data_lock = RLock()
 
         self.predictLock = RLock()
         self.predctThread = None
@@ -80,6 +69,10 @@ class IBApp(IBWrapper, IBClient):
         self.mergePredictThread = None
         self.chartData = None
         self.useStandardTiles = True
+        
+        self.optionMarketDataRequestTargetStrike = None
+        self.optionMarketDataRequestTargetStrikeLastRequested = None
+        self.skipContractDetailsReqMarketData = True
 
         self.marketDataPrefix = [
             ("TRADES", "", True),
@@ -126,16 +119,21 @@ class IBApp(IBWrapper, IBClient):
             print(f"Error getting offset configs for {symbol}: {e}")
             return None, None, None, None, None    
 
-    def setMarketDataType(self):
-        if (self.is_nyse_open()):
+    def setMarketDataType(self, includePremarket=False):
+        if (self.is_nyse_open(includePremarket)):
             self.reqMarketDataType(1)
         else:
-            self.reqMarketDataType(4)
+            self.reqMarketDataType(2)
 
-    def is_nyse_open(self):
+    def is_nyse_open(self, includePremarket=False):
         # Define NYSE working hours in Eastern Time
-        nyse_open_hour = 9  # 9:30 AM
-        nyse_open_minute = 30
+        if includePremarket:
+            nyse_open_hour = 4  # 9:30 AM
+            nyse_open_minute = 00
+        else:
+            nyse_open_hour = 9  # 9:30 AM
+            nyse_open_minute = 30
+            
         nyse_close_hour = 16  # 4:00 PM
 
         # Time zone for NYSE (Eastern Time)
@@ -149,6 +147,8 @@ class IBApp(IBWrapper, IBClient):
         nyse_close = now_nyse.replace(hour=nyse_close_hour, minute=0, second=0, microsecond=0)
 
         return nyse_open <= now_nyse < nyse_close
+    
+
 
     
     def nextReqId(self):
@@ -163,11 +163,18 @@ class IBApp(IBWrapper, IBClient):
         # Notify the waiting thread
         #with self.cond:
         #    self.cond.notify()
+    def has_prices_received(self):
+        df = self.options_data
+        # Check required columns
+        if "bid" not in df.columns or "ask" not in df.columns:
+            return False
 
+        mask = (df["bid"] > 0) & (df["ask"] > 0)
+        return bool(mask.any())
     def addToActionLog(self, action):
         with self.actionLock:
             self.actionLog.append((datetime.now(), action))
-        print(datetime.now(), action)
+            print(datetime.now(), action)
 
     def fetch_positions(self):
         self.reqPositions()
@@ -193,51 +200,110 @@ class IBApp(IBWrapper, IBClient):
 
             req = self.nextReqId()
             Logger.log("Requesting "+ symbol)
-            self.market_data_req_ids[req] = { "symbol": symbol }
-            self.reqMktData(req, contract, "", False, False, [])
+            if type == "STK":
+                self.setMarketDataType(True)
+            
+            with self._market_data_lock:
+                self.market_data_req_ids[req] = { "symbol": symbol }
+                self.reqMktData(req, contract, "", False, False, [])
+            
             time.sleep(0.1)  # To avoid pacing violations
+            if type == "STK":
+                self.setMarketDataType(False)
 
 
     def cancel_all_options_market_data(self):
         try:
-            keys = [*self.market_data_req_ids.keys()]
-            for req in keys:
-                # Logger.log("Canceling reqId "+ str(req))
-                self.cancelMktData(req)
-                if req in self.option_id_req.values() and req in self.market_data_req_ids:
-                    del self.market_data_req_ids[req]
-            self.option_id_req.clear()
+            # 1. Use list() to create a snapshot of keys to avoid mutation errors
+            with self._market_data_lock:
+                keys = [k for k,v in self.market_data_req_ids.items() if "id" in v]
+
+
+                for key in keys:
+                    # 2. Strict check: Skip if the key is None or an empty string
+                    if key is None:
+                        continue
+                    
+                    req = key
+                    if req in self.market_data_req_ids:
+                        
+
+                        try:
+                            self.cancelMktData(req)
+                            time.sleep(0.1)  # To avoid pacing violations
+                            
+                        except Exception as inner_e:
+                            Logger.log(f"Failed to cancel specific reqId {req}: {inner_e}")
+                            continue
+
+                        # 5. Type-safe deletion
+                        del self.market_data_req_ids[req]
+
+            # 6. Clear the mapping table
+            if isinstance(self.option_id_req, dict):
+                self.option_id_req.clear()
+
         except Exception as e:
-            self.addToActionLog("Error canceling all market data: " + str(e))
-            Logger.log("Error canceling all market data: " + str(e))
+            error_msg = f"Error canceling all market data: {e}"
+            self.addToActionLog(error_msg)
+            Logger.log(error_msg)
 
     def cancel_options_market_data(self,options_data):
         try:
             id = options_data.get("Id", None)
+            
             if id is None:
                 id = options_data.get("ConId", None)
             if (id not in self.option_id_req):
                 return
             
+            self.addToActionLog(f"canceling  market data for {id}")
             
             req = self.option_id_req.get(id, None)
+            with self._market_data_lock:
+                if req is None or req not in self.market_data_req_ids:
+                    return
+                self.addToActionLog(f"   cancel  market data for {id} - reqId {req}")
+                
+                self.cancelMktData(req)
+                
+                del self.market_data_req_ids[req]
+                del self.option_id_req[id]
 
-            if req is None or req not in self.market_data_req_ids:
-                return
-            
-            self.cancelMktData(req)
-            
-            del self.market_data_req_ids[req]
         except Exception as e:
             self.addToActionLog("Error canceling market data: " + str(e))
+
+
 
     def request_all_options_data(self):
         try:
             symbol, _, _ = self.focusContract
-            info = self.checkUnderlyingOptions(symbol)
-            price = info.get("price")
+            if self.optionMarketDataRequestTargetStrike is not None:
+                price = self.optionMarketDataRequestTargetStrike
+            else:
+                info = self.checkUnderlyingOptions(symbol)
+                price = info.get("price")
+                
+                    
 
             if (price):
+
+                Logger.log(f"Requesting market data for strike {price}")
+                        
+                self.optionMarketDataRequestTargetStrikeLastRequested = price
+                df = self.options_data
+
+                # Compute % distance from the given price
+                df = df.copy()
+                df["strikeDistance"] = (df["Strike"] - price).abs() / price * 100
+
+                # Select contracts within ±1%
+                near_contracts = df[df["strikeDistance"] <= 1]
+
+                # Subscribe market data for each contract
+                for _, contract in near_contracts.iterrows():
+                    self.request_options_market_data(contract)
+                """                
                 for _, contract in self.options_data.iterrows():
                     # Logger.logText(contract["Symbol"]+" "+str(contract["Strike"])+" "+str(contract["Type"]))
                     if (contract["Symbol"] == symbol):
@@ -245,46 +311,50 @@ class IBApp(IBWrapper, IBClient):
 
                         if strikeDistance <= 1:
                             self.request_options_market_data(contract)
+                """
         except Exception as e:
             Logger.log(str(e))
         
     def request_options_market_data(self,options_data):
-        if (options_data is None):
-            return
-        
-        utcnow = datetime.now(dttimezone.utc)
-        time_value = options_data.get("time")
-        if isinstance(time_value, datetime):
-            if (utcnow - time_value).total_seconds() > 60:
-                self.cancel_options_market_data(options_data)
+        try:
+            if (options_data is None):
+                return
+            
+            utcnow = datetime.now(dttimezone.utc)
+            time_value = options_data.get("time")
+            if isinstance(time_value, datetime):
+                if (utcnow - time_value).total_seconds() > 60:
+                    self.cancel_options_market_data(options_data)
+                    time.sleep(0.1)  # To avoid pacing violations
+
+                    # Locate the correct row by ConId and update the columns
+                    con_id = options_data["ConId"]
+                    if con_id is not None:
+                        row_mask = self.options_data["ConId"] == con_id
+                        self.options_data.loc[row_mask, ["delta", "bid", "ask", "undPrice"]] = None
+
+
+            if (options_data["ConId"] in self.option_id_req):
+                Logger.logText(f"options ID already subscribed data available {options_data['ConId']}")
+                #print(options_data)
+
+                return
+            
+            req = self.nextReqId()
+            with self._market_data_lock:
+                self.market_data_req_ids[req] = { "id": options_data["ConId"] }
+                self.option_id_req[options_data["ConId"]] = req    
+                contract = Contract()
+                contract.conId = int(options_data["ConId"])
+                contract.exchange = "SMART"
+                contract.secType = "OPT"
+
+
+                self.reqMktData(req, contract, "", False, False, [])
+                self.addToActionLog(f"Requesting market data for {contract.conId} - reqId { req } - { options_data['Symbol'] } { options_data['Type'] } {options_data['Strike']}")
                 time.sleep(0.1)  # To avoid pacing violations
-
-                # Locate the correct row by ConId and update the columns
-                con_id = options_data["ConId"]
-                if con_id is not None:
-                    row_mask = self.options_data["ConId"] == con_id
-                    self.options_data.loc[row_mask, ["delta", "bid", "ask", "undPrice"]] = None
-
-
-        if (options_data["ConId"] in self.option_id_req):
-            # print("options ID already subscribed data available", options_data["ConId"])
-            #print(options_data)
-
-            return
-        
-        req = self.nextReqId()
-        
-        self.market_data_req_ids[req] = { "id": options_data["ConId"] }
-        self.option_id_req[options_data["ConId"]] = req    
-        contract = Contract()
-        contract.conId = options_data["ConId"]
-        contract.exchange = "SMART"
-        contract.secType = "OPT"
-
-        # self.addToActionLog("Requesting market data for " + options_data["Symbol"] + " " + options_data["Type"] + " " + str(options_data["Strike"]))
-
-        self.reqMktData(req, contract, "", False, False, [])
-        time.sleep(0.1)  # To avoid pacing violations
+        except Exception as e:
+            self.addToActionLog(f"Error in request_options_market_data {str(e)}")
 
     def business_days_since_last_request(self, inclusive: bool = True) -> int:
         if not hasattr(self, "lastRequestedDateForContracts") or self.lastRequestedDateForContracts is None:
@@ -322,6 +392,7 @@ class IBApp(IBWrapper, IBClient):
             symbol, type,ex = symbol_type
             try:
                 send_telegram_message(f"Fetching options for {symbol} {date.strftime('%Y-%m-%d')}")
+                self.addToActionLog(f"Fetching options for {symbol} {date.strftime('%Y-%m-%d')}")
             except Exception as e:
                 self.addToActionLog("Error sending telegram message: " + str(e))
 
@@ -335,9 +406,11 @@ class IBApp(IBWrapper, IBClient):
                 contract.exchange = "SMART"
                 contract.lastTradeDateOrContractMonth = date.strftime("%Y%m%d")
                 contract.right = right
-                self.market_data_req_ids[req] = { "date": date, "symbols": symbols }
-                self.reqContractDetails(req, contract)
-                
+                with self._market_data_lock:
+                    self.market_data_req_ids[req] = { "date": date, "symbols": symbols }
+                    self.addToActionLog(f"Requested {str(contract)}")
+                    self.reqContractDetails(req, contract)
+                    
                 time.sleep(0.1)  # To avoid pacing violations
 
     def find_iron_condor_legs(self, puts, calls, current_price, distance=5, wingspan=5):
@@ -625,18 +698,6 @@ class IBApp(IBWrapper, IBClient):
                     "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame())),
                     "colspan": 2
                 },
-                {
-                    "title": "Candle Data",
-                    "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
-                    "colspan": 4,
-                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
-                },
-                {
-                    "title": "Candle Data VIX",
-                    "content": self.candleData.get("VIX", pd.DataFrame()).iloc[::-1],
-                    "colspan": 4,
-                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
-                },
 
                 
                 *self.getAdditionalTiles(),
@@ -655,6 +716,20 @@ class IBApp(IBWrapper, IBClient):
             ]
     
         """
+
+                {
+                    "title": "Candle Data",
+                    "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
+                    "colspan": 4,
+                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
+                },
+                {
+                    "title": "Candle Data VIX",
+                    "content": self.candleData.get("VIX", pd.DataFrame()).iloc[::-1],
+                    "colspan": 4,
+                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
+                },
+                
                     {
                 "title": "SPX Distances",
                 "content": self.get_optimal_offsets(self.candleData.get(symbol, pd.DataFrame())),
@@ -681,13 +756,24 @@ class IBApp(IBWrapper, IBClient):
             try:
               if callable(func):  # If it's a single function
                 result = func()
+                self.addToActionLog(f"{func.__name__}: {result}")
                 tiles.append({
                     "title": func.__name__,
                     "content": result,
                 })
               elif isinstance(func, dict):  # If it's a dictionary with predefined attributes
-                result = func.get("function")()
-
+                
+                
+                resultFunction = func.get("function", None)
+                if not resultFunction:
+                    result = func.get("content", None)
+                else:
+                    result = resultFunction()
+                """
+                if (isinstance(result, str) and resultFunction):
+                    self.addToActionLog(f"{resultFunction.__name__}: {result}")
+                """
+                    
                 
                 # check if result is a dict with at least key content
                 if result is not None and isinstance(result, dict) and "content" in result:
@@ -901,16 +987,20 @@ class IBApp(IBWrapper, IBClient):
         
     @iswrapper
     def error(self, reqId, errorTime, errorCode, errorString, advancedOrderRejectJson=""):
+        self.addToActionLog(f"Error. Id: {reqId}, Time: {errorTime}, Code: {errorCode}, Msg: {errorString}")
+        
         if (errorCode == 300):
             optionReq = self.option_id_req.get(reqId, None)
             if (optionReq is not None):
                 del self.option_id_req[optionReq]                
                 return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
-            mktReq = self.market_data_req_ids.get(reqId, None)
-            if (mktReq is not None):
-                del self.market_data_req_ids[reqId]
-                return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
-        info = self.market_data_req_ids.get(reqId, None)
+            with self._market_data_lock:
+                mktReq = self.market_data_req_ids.get(reqId, None)
+                if (mktReq is not None):
+                    del self.market_data_req_ids[reqId]
+                    return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+        with self._market_data_lock:
+            info = self.market_data_req_ids.get(reqId, None)
         if (info is not None and "date" in info):
             requestDate = info.get("date", None)
             symbols = info.get("symbols", None)
@@ -940,6 +1030,42 @@ class IBApp(IBWrapper, IBClient):
             symbols = self.optionUnderlyings
             self.fetch_options_data(symbols, plus_one)
 
+    def fetch_next_days_options_data(self, daysToAdd=1):
+        """
+        Requests option data for every valid day between the last requested date
+        and lastRequestedDate + daysToAdd. Skips weekends.
+        """
+
+        # Normalize lastRequestedDateForContracts to a date
+        last = self.lastRequestedDateForContracts
+        if last is None:
+            current = datetime.today().date()
+        else:
+            current = last.date() if hasattr(last, "date") else last
+
+        # Compute target date based on daysToAdd
+        target = current + timedelta(days=daysToAdd)
+        
+        # Normalize target to next trading day if weekend
+        while target.weekday() in (5, 6):  # Saturday=5, Sunday=6
+            target += timedelta(days=1)
+
+        symbols = self.optionUnderlyings
+
+        # Walk day-by-day until target date
+        while current < target:
+            
+            current += timedelta(days=1)
+
+            # Skip weekends
+            if current.weekday() in (5, 6):  # Saturday=5, Sunday=6
+                continue
+
+            # Fetch data for this day
+            self.fetch_options_data(symbols, current)
+
+            # Update last requested date
+            self.lastRequestedDateForContracts = current
 
 
     def reset_options_data(self):
@@ -1041,9 +1167,7 @@ class IBApp(IBWrapper, IBClient):
 
         return valid.iloc[0]
 
-        
 
-    
     """
     def get_closest_delta_row(self, symbol, target_delta, type="C", nth_closest=1):
         df_symbol = self.filter_options_data(symbol, type)
@@ -1122,7 +1246,86 @@ class IBApp(IBWrapper, IBClient):
                     return lower_rows.loc[lower_rows["Strike"].idxmax()]
 
         return None
-    
+  
+  
+    def find_closest_strike_by_dte(self, df: pd.DataFrame, symbol, strike, option_type):
+        """
+        Find a row matching the option_type/strike direction and return the row with the
+        smallest non-negative DTE. If multiple rows share the same (smallest) DTE,
+        return the one whose Strike is closest to the target strike.
+
+        Assumes the DataFrame already contains a numeric 'DTE' column and a 'Strike' column.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame containing at least 'Strike' and 'DTE' columns.
+        strike : float | int | None
+            Target strike to compare against.
+        option_type : str
+            'put'/'P' or 'call'/'C' (case-insensitive).
+
+        Returns
+        -------
+        pd.Series | None
+            The selected row (as a pandas Series) or None if no suitable row found.
+        """
+        if strike is None:
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        ot = str(option_type).strip().lower()
+        is_put = ot in ("put", "p", "P")
+        is_call = ot in ("call", "c", "C")
+        if not (is_put or is_call):
+            return None
+
+        # Work on a copy to avoid mutating caller's DataFrame
+        df = df[(df["Symbol"] == symbol) & (df["Type"] == option_type)].copy()
+
+        # Ensure required columns exist
+        if "Strike" not in df.columns or "DTE" not in df.columns:
+            return None
+
+        # Coerce types safely
+        df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
+        df["DTE"] = pd.to_numeric(df["DTE"], errors="coerce")
+
+        # Keep only rows with valid strike and non-negative DTE
+        df = df[df["Strike"].notna() & df["DTE"].notna() & (df["DTE"] >= 0)]
+        if df.empty:
+            return None
+
+        # Primary direction selection (prefer in-direction strikes; fall back to opposite)
+        if is_put:
+            primary = df[df["Strike"] <= strike]
+            opposite = df[df["Strike"] > strike]
+        else:  # call
+            primary = df[df["Strike"] >= strike]
+            opposite = df[df["Strike"] < strike]
+
+        candidates = primary if not primary.empty else opposite
+        if candidates.empty:
+            return None
+
+        # Choose rows with minimum DTE (closest expiry)
+        min_dte = int(candidates["DTE"].min())
+        same_dte = candidates[candidates["DTE"] == min_dte]
+
+        # If multiple rows share the same DTE, pick the strike closest to target strike
+        if len(same_dte) == 1:
+            chosen = same_dte.iloc[0]
+        else:
+            # compute absolute difference to strike and pick smallest
+            same_dte = same_dte.copy()
+            same_dte["__strike_diff"] = (same_dte["Strike"] - float(strike)).abs()
+            idx = same_dte["__strike_diff"].idxmin()
+            chosen = same_dte.loc[idx].drop(labels="__strike_diff", errors="ignore")
+
+        return chosen
+   
     def find_single_contract_by_mid_price(self, symbol, target_midprice, option_type="C"):
         try:
             # Check if options data is available
@@ -1148,6 +1351,26 @@ class IBApp(IBWrapper, IBClient):
 
         except Exception as e:
             self.addToActionLog("mid price error: " + str(e))
+            return None
+
+    def find_single_contract_by_id(self, id):
+        try:
+            # Check if options data is available
+            if self.options_data.empty:
+                return None
+
+            # Filter the dataframe
+            filtered_df = self.options_data.loc[self.options_data["ConId"] == id]
+
+            if not filtered_df.empty:
+                # .iloc[0] converts the single-row DataFrame into a Series
+                row = filtered_df.iloc[0]
+                self.request_options_market_data(row)
+                return row
+            return None
+
+        except Exception as e:
+            self.addToActionLog("by id  error: " + str(e))
             return None
 
 
@@ -1611,15 +1834,15 @@ class IBApp(IBWrapper, IBClient):
                 candleSize = candleSizeForce
 
             reqId = self.nextReqId()
-
-            self.market_data_req_ids[reqId] = { "symbol": symbol, "prefix": prefix, "candleSize": candleSize }
-            self.addToActionLog("Requesting historical data for " + symbol + " "+ str(reqId ))
-            print("Requesting historical data for " + whatToShow + " " + symbol + " "+ str(reqId ), lookBackTime)
+            with self._market_data_lock:
+                self.market_data_req_ids[reqId] = { "symbol": symbol, "prefix": prefix, "candleSize": candleSize }
+                self.addToActionLog("Requesting historical data for " + symbol + " "+ str(reqId ))
+                print("Requesting historical data for " + whatToShow + " " + symbol + " "+ str(reqId ), lookBackTime)
+                
+                self.reqHistoricalData(reqId, contract, "", lookBackTime, candleSize, whatToShow, 1, 2, upToDate, [])
             
-            self.reqHistoricalData(reqId, contract, "", lookBackTime, candleSize, whatToShow, 1, 2, upToDate, [])
-        
-            # self.reqHistoricalData(reqId, contract, "", self.lookBackTime, "5 mins", "TRADES", 1, 1, True, [])
-            time.sleep(1)  # To avoid pacing violations
+                # self.reqHistoricalData(reqId, contract, "", self.lookBackTime, "5 mins", "TRADES", 1, 1, True, [])
+                time.sleep(0.1)  # To avoid pacing violations
 
 
 
@@ -1629,15 +1852,15 @@ class IBApp(IBWrapper, IBClient):
             self.logger.debug(f"Received historicalData for reqId: {reqId}")
             
 
+            with self._market_data_lock:
+                if reqId not in self.market_data_req_ids:
+                    self.logger.error(f"reqId {reqId} not found in market_data_req_ids")
+                    self.cancelHistoricalData(reqId)
+                    return
 
-            if reqId not in self.market_data_req_ids:
-                self.logger.error(f"reqId {reqId} not found in market_data_req_ids")
-                self.cancelHistoricalData(reqId)
-                return
-
-            # Fetch symbol and prefix for the current request ID
-            symbol = self.market_data_req_ids[reqId]["symbol"]
-            prefix = self.market_data_req_ids[reqId]["prefix"]
+                # Fetch symbol and prefix for the current request ID
+                symbol = self.market_data_req_ids[reqId]["symbol"]
+                prefix = self.market_data_req_ids[reqId]["prefix"]
 
             # print(f"Received historicalData for reqId: {reqId} symbol: {symbol} prefix: {prefix}", end="\r")
             self.initDataFrame(symbol)
@@ -1684,7 +1907,8 @@ class IBApp(IBWrapper, IBClient):
 
 
     def addIndicators(self, reqId):
-        symbol = self.market_data_req_ids[reqId]["symbol"]
+        with self._market_data_lock:
+            symbol = self.market_data_req_ids[reqId]["symbol"]
         self.addIndicatorsFor(symbol)
 
     def addIndicatorsFor(self, symbol):
@@ -1716,7 +1940,7 @@ class IBApp(IBWrapper, IBClient):
         self.addToActionLog("Historical data request completed for reqId: " + str(reqId))
         
         self.addIndicators(reqId)
-        self.saveCandle()
+        # self.saveCandle()
         return super().historicalDataEnd(reqId, start, end)
 
     @iswrapper
@@ -1826,21 +2050,30 @@ class IBApp(IBWrapper, IBClient):
 
     @iswrapper
     def contractDetailsEnd(self, reqId):
+        self.contractDetailsPending = False
+        if self.skipContractDetailsReqMarketData:
+            return super().contractDetailsEnd(reqId)
         self.lastContractsDataUpdatedAt = datetime.now()
         contract: Contract = self.contract_details[reqId]
         symbol = contract.symbol
 
         #Check for underlying price
-        current_price = self.getPriceForSymbol(symbol)   
+        if self.optionMarketDataRequestTargetStrike:
+            current_price = self.optionMarketDataRequestTargetStrike
+        else:
+            current_price = self.getPriceForSymbol(symbol)   
         if current_price is None:
             return
-        
+        try:
+            send_telegram_message(f"Requesting market data at target price {current_price}")
+        except:
+            Logger.logText("Cant send target price message")
         optionsForSymbol = self.options_data[self.options_data["Symbol"] == symbol]
         calls = optionsForSymbol[optionsForSymbol["Type"] == "C"]
         puts = optionsForSymbol[optionsForSymbol["Type"] == "P"]
 
         minDistance = -5
-        maxDistance = 80
+        maxDistance = 5
 
         # vector find puts and calls in distance
         callsInDistance = calls[(calls["Strike"] - current_price) <= maxDistance]
@@ -1849,10 +2082,24 @@ class IBApp(IBWrapper, IBClient):
         putsInDistance = putsInDistance[(current_price - putsInDistance["Strike"]) >= minDistance]
 
         # request market data for each option in distance
+        count = 0
         for index, row in callsInDistance.iterrows():
-            self.request_options_market_data(row)
+            try:
+                self.request_options_market_data(row)
+                count += 1
+            finally:
+                pass
         for index, row in putsInDistance.iterrows():
-            self.request_options_market_data(row)
+            try:
+                self.request_options_market_data(row)
+                count += 1
+            finally:
+                pass
+            
+        Logger.logText(f"Requested {count} options data")
 
         return super().contractDetailsEnd(reqId)
+
+
+        
     

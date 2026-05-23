@@ -1,19 +1,28 @@
 {
 	"folders": [
 		{
+			"name": "dimely-zero-bot",
 			"path": "."
 		},
 		{
+			"name": "tws-python-import",
 			"path": "../tws-python-import"
 		},
 		{
+			"name": "Testbed",
 			"path": "../../../../TWS API/samples/Python/Testbed"
 		},
 		{
+			"name": "nuxt-tws-dashboard",
 			"path": "../nuxt-tws-dashboard"
 		},
 		{
+			"name": "tasty-bot",
 			"path": "../tasty-bot"
+		},
+		{
+			"name": "pythonclient",
+			"path": "../../../../TWS API/source/pythonclient"
 		}
 	],
 	"settings": {

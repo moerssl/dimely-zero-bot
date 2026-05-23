@@ -9,7 +9,7 @@ from ibapi.utils import iswrapper
 from ibapi.common import *
 import pandas as pd
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import RLock
 import numpy as np
 
@@ -25,7 +25,7 @@ class IBWrapper(EWrapper):
         self.market_data = pd.DataFrame(columns=["Symbol", "DateTime", "Price"])
         with self.optionsDataLock:
             self.options_data = pd.DataFrame(columns=[
-                "Id", "Symbol", "Strike", "dist", "undPrice", "Type", "delta", "bid", "ask", "time", "bid_size", "ask_size", "last", "Expiry",
+                "Id", "Symbol", "Strike", "dist", "undPrice", "Type", "delta", "bid", "ask", "time", "bid_size", "ask_size", "last", "DTE", "Expiry",
                 "close", "high", "low",
                 "ConId", "UnderConId", "impliedVol", "optPrice", "pvDividend", "gamma", "vega", "theta", "delta_diff"
             ])
@@ -36,6 +36,9 @@ class IBWrapper(EWrapper):
 
 
         self.contract_details = {}
+        self.contractDetailsPending = False
+        
+
 
     @iswrapper
     def position(self, account: str, contract: Contract, position: float, avgCost: float):
@@ -64,11 +67,7 @@ class IBWrapper(EWrapper):
 
 
 
-    @iswrapper
-    def positionEnd(self):
-        
-        # self.positions = pd.concat([self.positions, pd.DataFrame([new_row])], ignore_index=True)
-        return super().positionEnd()
+
     
     @iswrapper
     def tickOptionComputation(self, reqId, tickType, tickAttrib, impliedVol, delta, optPrice, pvDividend, gamma, vega, theta, undPrice):
@@ -81,6 +80,8 @@ class IBWrapper(EWrapper):
             id = entry["id"]
             #print("Tick Price. Ticker Id:", reqId, "Id:", id, "Type:", text, "Price:", price)
             with self.optionsDataLock:
+                if id not in self.options_data.index:
+                    return
                 strike = self.options_data.loc[id, "Strike"]
                 type = self.options_data.loc[id, "Type"]
 
@@ -93,7 +94,12 @@ class IBWrapper(EWrapper):
                     if (distance > percentage):
                         self.cancel_options_market_data({"Id": id})
 
-                
+                now = datetime.now(timezone.utc)
+                last = self.options_data.loc[id, "time"]
+
+                if last and not pd.isna(last) and (now - last).total_seconds() > 60:
+                    self.cancel_options_market_data({"Id": id})
+
                 
 
 
@@ -158,7 +164,7 @@ class IBWrapper(EWrapper):
                       if not (val > 0):
                           text = delayed_text
 
-                self.options_data.loc[id, text] = size
+                self.options_data.loc[id, text] = float(size)
                 self.options_data.loc[id, "time"] = datetime.now(timezone.utc)
 
         return super().tickSize(reqId, tickType, size)
@@ -187,25 +193,68 @@ class IBWrapper(EWrapper):
     def error(self, reqId, errorTime, errorCode, errorString, advancedOrderRejectJson=""):
         Logger.log(f"Error. Id: {reqId}, Time: {errorTime}, Code: {errorCode}, Msg: {errorString}")
         return super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
-
+    
+    def calculate_dte(self, date_string):
+        # Convert string 'YYYYMMDD' to a date object
+        target_date = datetime.strptime(date_string[0], "%Y%m%d").date()
+        
+        # Get today's date
+        today = date.today()
+        
+        # Subtract the dates to get a timedelta object
+        delta = target_date - today
+        
+        # Return the number of days
+        return delta.days   
     @iswrapper
     def contractDetails(self, reqId: int, contractDetails: ContractDetails):
         
         self.contract_details[reqId] = contractDetails.contract
-        
+        expiry = self._normalize_expiry(contractDetails.contract.lastTradeDate),
+        dte = self.calculate_dte(expiry)
+        now_utc = datetime.now(timezone.utc)
         new_row = {            
             "ConId": contractDetails.contract.conId,
             "Symbol": contractDetails.contract.symbol,
             "Strike": contractDetails.contract.strike,
             "Type": contractDetails.contract.right,
-            "Expiry": contractDetails.contract.lastTradeDate,
+            "DTE": dte,
+            "Expiry": expiry[0],
             "UnderConId": contractDetails.underConId,
-            "reqId": reqId
+            "reqId": reqId,
+            'time': now_utc
             
         }
         with self.optionsDataLock:
             self.options_data.loc[contractDetails.contract.conId] = new_row
 
 
+    @staticmethod
+    def _normalize_expiry(raw: str) -> str:
+        """
+        Normalises all known IBAPI lastTradeDate formats to clean YYYYMMDD.
+
+        Known formats:
+        "20250321"              → "20250321"   (already clean)
+        "20250321 15:00:00"     → "20250321"   (strip time suffix)
+        "20250321-15:00:00"     → "20250321"   (strip UTC dash notation)
+        "202503"                → "20250331"   (contract month → last day of month)
+        """
+        if not raw:
+            return raw
+
+        raw = raw.strip()
+
+        # Strip time suffix: "20250321 15:00:00" or "20250321-15:00:00"
+        # Only strip if it starts with 8 digits (avoid mangling YYYYMM)
+        if len(raw) > 8 and raw[:8].isdigit():
+            raw = raw[:8]
+
+        # Contract month YYYYMM → last calendar day of that month
+        if len(raw) == 6 and raw.isdigit():
+            dt = pd.to_datetime(raw, format="%Y%m") + pd.offsets.MonthEnd(0)
+            return dt.strftime("%Y%m%d")
+
+        return raw  # Already YYYYMMDD
     
    

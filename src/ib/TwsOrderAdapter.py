@@ -43,6 +43,7 @@ class TwsOrderAdapter(EWrapper, EClient):
         self.lastContractsDataUpdatedAt = None
         self.latestPositionClosedTime = None
         self.orderLock = Lock()
+        self._positionEndHandlers = []
 
 
 
@@ -679,9 +680,9 @@ class TwsOrderAdapter(EWrapper, EClient):
         except Exception as e:
             self.addToActionLog("Error placing order: " + str(e))
 
-    def place_single_contract_order(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None, mid=None, doTransmit=True):
+    def place_single_contract_order(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None, mid=None, doTransmit=True, outsideRTH=False):
         # start a new thread to place the order
-        thread = Thread(target=self.place_single_contract_order_threaded, args=(row, action, quantity, orderType, orderRef, tp, sl, mid, doTransmit))
+        thread = Thread(target=self.place_single_contract_order_threaded, args=(row, action, quantity, orderType, orderRef, tp, sl, mid, doTransmit, outsideRTH))
         thread.start()
 
     def placeOrder(self, orderId, contract, order):        
@@ -721,7 +722,7 @@ class TwsOrderAdapter(EWrapper, EClient):
 
         return super().placeOrder(orderId, contract, order)
     
-    def place_single_contract_order_threaded(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None, mid=None, doTransmit=True):
+    def place_single_contract_order_threaded(self, row, action: str="BUY", quantity: int=1, orderType: str="LMT", orderRef: str="ORB", tp=None, sl=None, mid=None, doTransmit=True, outsideRTH=False):
         
         try:
             with self.orderLock:
@@ -754,14 +755,20 @@ class TwsOrderAdapter(EWrapper, EClient):
                     midPrice = (row.get("ask") + row.get("bid")) / 2 if row.get("ask") is not None and row.get("bid") is not None else None
                 else:
                     midPrice = mid
+                    
+                if not midPrice > 0:
+                    return
 
                 price = self.round_to_next_multiple(midPrice, multiple)
                 
                 parentOrder = self.create_order(action, quantity, orderType, price)
                 parentOrderId = self.nextOrderId()
-                parentOrder.orderRef = orderRef
-                parentOrder = self.enhanceOrderWithUrgentPrio(parentOrder)
-                parentOrder = self.enhanceOrderToCancelInTime(parentOrder)
+                parentOrder.orderRef = orderRef+contract.symbol
+                if (outsideRTH):
+                    parentOrder.outsideRth = True
+                else:
+                    parentOrder = self.enhanceOrderWithUrgentPrio(parentOrder)
+                    parentOrder = self.enhanceOrderToCancelInTime(parentOrder)
 
                 tpOrder = None
                 slOrder = None
@@ -846,8 +853,24 @@ class TwsOrderAdapter(EWrapper, EClient):
             self.positions[contract.conId]["underExchange"] = contract.underExchange if hasattr(contract, 'underExchange') else None
         return super().position(account, contract, position, avgCost)
     
-    
 
+
+
+    @iswrapper  
+    def positionEnd(self):
+        for func in self._positionEndHandlers:
+            try:
+                func()
+            finally:
+                pass
+        
+        # self.positions = pd.concat([self.positions, pd.DataFrame([new_row])], ignore_index=True)
+        return super().positionEnd()
+    
+    
+    def onPositionEnd(self, func):
+        self._positionEndHandlers.append(func)
+        
     @iswrapper
     def openOrder(self, orderId: int, contract: Contract, order: Order, orderState: OrderState):
         Logger.log(f"Received Order {contract}")
@@ -946,6 +969,19 @@ class TwsOrderAdapter(EWrapper, EClient):
             if position["symbol"] == symbol and position["secType"] == "STK":
                 return position
         return None
+    
+    def getOptionPositionsForSymbol(self, symbol: str, shortOnly=False):
+        """
+        Get stock positions for a given symbol.
+        :param symbol: The symbol to check.
+        :return: List of stock positions for the symbol.
+        """
+        foundPositions = []
+        for conId, position in self.positions.items():
+            if position["symbol"] == symbol and position["secType"] == "OPT":
+                if (not shortOnly or (shortOnly and position["position"] < 0)):
+                    foundPositions.append(position)
+        return foundPositions
 
     def hasPositionsForSymbol(self, symbol: str, type: str = None):
         """

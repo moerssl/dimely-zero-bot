@@ -91,7 +91,7 @@
                 "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT6174920812210117393",
 
                 "kwargs": {
-                    "short_delta": 0.4,
+                    "short_delta": 0.30,
                     "long_delta": 0.1
                 }
                 
@@ -111,7 +111,7 @@
                     },
                     {
                         "day_of_week": "mon-fri",
-                        "hour": "10-13",
+                        "hour": "10-15",
                         "minute": "*",
                         "second": "0/30"
                     }
@@ -119,35 +119,52 @@
                 ]
             },
             {
-                "id": "checkLongPosition_IWM",
+                "id": "takeProfit_IWM",
                 "function": "checkLongPositionTakeProfit",
                 "terminalTitle": false,
-
+                "kwargs": {
+                    "requiredDistance": 0.005
+                },
                 
                 "multi": [
                     {
                         "day_of_week": "mon-fri",
-                        "hour": "9",
-                        "minute": "34-59",
-                        "second": "10,40,59"
-                    },
-                    {
-                        "day_of_week": "mon-fri",
-                        "hour": "10-13",
+                        "hour": "4-13",
                         "minute": "*",
-                        "second": "0/30"
+                        "second": "10,40,59"
                     }
                     
                 ]
             },
             {
+                "id": "takeOptionsProfit_IWM",
+                "function": "checkOptionPositionProfit",
+                "terminalTitle": false,               
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": "4-13",
+                        "minute": "*",
+                        "second": "15,45"
+                    }
+                    
+                ]
+            },
+
+            {
                 "id": "shutdown_IWM",
-                "function": "shutdown",
+                "function": "shutdown_",
                 "multi": [
                     {
                         "day_of_week": "*",
+                        "hour": "9",
+                        "minute": "25",
+                        "second": "30"
+                    },
+                    {
+                        "day_of_week": "*",
                         "hour": "10",
-                        "minute": "16",
+                        "minute": "10",
                         "second": "30"
                     },
                     {
@@ -237,27 +254,24 @@
         ],
         "SPX": [
             {
-                "id": "checkFixedDistanceIronCondor_SPX",
+                "id": "dale_iron_fly_primary",
                 "function": "checkSeparatedIronCondor",
                 "day_of_week": "mon-fri",
-                "hour": 14,
-                "minute": "36-40",
-                "second": "0/30",
+                "hour": 10,
+                "minute": 30,
                 "terminalTitle": true,
-                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT21749736019710462132",
-
                 "kwargs": {
-                    "callDistance": 0.5,
-                    "putDistance": -0.5,
-                    "wingspan": 15,
-                    "tp": 80,
-                    "sl": 170,
-                    "touchDistance": 25
+                    "callDistance": 0,
+                    "putDistance": 0,
+                    "wingspan": 50,
+                    "tp": 0.5,
+                    "sl": 1.0,
+                    "order": false
                 }
             },
             {
                 "id": "shutdownOrb_SPX",
-                "function": "shutdown",
+                "function": "shutdown_",
                 "day_of_week": "mon-fri",
                 "hour": 14,
                 "minute": "45",

@@ -9,33 +9,36 @@ const routes = router.getRoutes()
 </script>
 
 <template>
-  <header>
-    <!-- Generate menu from router-->
-    <img alt="Vue logo" class="logo" src="@/assets/logo.svg" width="125" height="125" />
-    <nav>
-      <RouterLink :to="route.path" v-for="route in routes">{{ route.name }}</RouterLink>
-    </nav>
-    <div class="sub">
-      <select v-model="orderStore.port">
-        <option value="8051">IWM</option>
-        <option value="8052">QQQ</option>
-        <option value="8053">SPY</option>
-        <option value="8054">SPX</option>
-        <option value="8055">XSP</option>
-        <option value="8050">Other</option>
-      </select>
-      <span :class='{"show": orderStore.loading }'>Lade&nbsp;Daten...</span>
+  <v-app>
+      <header>
+        <!-- Generate menu from router-->
+        <img alt="Vue logo" class="logo" src="@/assets/logo.svg" width="125" height="125" />
+        <nav>
+          <RouterLink :to="route.path" v-for="route in routes">{{ route.name }}</RouterLink>
+        </nav>
+        <v-chip>Test</v-chip>
+        <div class="sub">
+          <select v-model="orderStore.port">
+            <option value="8051">IWM</option>
+            <option value="8052">QQQ</option>
+            <option value="8053">SPY</option>
+            <option value="8054">SPX</option>
+            <option value="8055">XSP</option>
+            <option value="8050">Other</option>
+          </select>
+          <span :class='{"show": orderStore.loading }'>Lade&nbsp;Daten...</span>
 
-    </div>
+        </div>
 
-      <!-- pre>
+          <!-- pre>
 
-        {{ routes }}
-      </pre -->
+            {{ routes }}
+          </pre -->
 
 
-  </header>
-  <RouterView />
+      </header>
+      <RouterView/>
+  </v-app>
 </template>
 
 <style scoped>

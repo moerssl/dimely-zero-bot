@@ -10,9 +10,8 @@ from wakepy import keep
 # Import your IBApp and related modules.
 from ib.IBApp import IBApp
 from ib.TwsOrderAdapter import TwsOrderAdapter
-from display.tiled import display_data_tiled
+from display.tiled import  display_data_tiled
 from display.dash_app import start_dash_app
-from util.Chart import Chart
 
 
 # Import the predictor class.
@@ -77,6 +76,23 @@ async def main():
         client_id = startClientId
         startClientId += 1
         return client_id
+    
+    def req():
+        stock_position = orderApp.getStockPositionsForSymbol(focusContractSymbol)
+        app.setMarketDataType()
+
+        if stock_position:
+            targetStrikeByPosition = stock_position.get("avgCost", None)
+            if targetStrikeByPosition:
+                app.optionMarketDataRequestTargetStrike = targetStrikeByPosition
+
+        
+        app.request_market_data(symbols)
+        app.fetch_options_data(optionSymbols)
+        app.request_all_options_data()
+        
+    orderApp.onPositionEnd(req)
+    
 
     historyCandles = {}
     scheduler.historySymbols = focusSymbol
@@ -85,19 +101,30 @@ async def main():
 
     app.candleData = historyCandles
     historyApp.candleData = historyCandles
+
     app.additionalTilesFuncs.append({
-        "function": scheduler.printEnhancedPredictions,
-        "title": "Enhanced Predictions",
-        "colspan": 3
-    })
+        "content": f"http://localhost:{portMap.get(symbolParam.upper(), 8050)}",
+        "title": "Port for web app", 
+        "colspan": 1
+        })
     app.additionalTilesFuncs.append(scheduler.get_jobs_dataframe)
-    app.additionalTilesFuncs.append(scheduler.printPredictions)
     app.additionalTilesFuncs.append(orderApp.minutesPassedSinceLastPositionClosed)
     app.additionalTilesFuncs.append(scheduler.print_stock_positions)
+    app.additionalTilesFuncs.append({
+        "function": scheduler.print_short_option_itm_check,
+        "colspan": 2,
+        "title": "Options"
+        })
+    app.additionalTilesFuncs.append({
+        "content": (lambda d: d.iloc[(d["delta"] - 50).abs().argsort()] if "delta" in d.columns else d)(scheduler.app.options_data),        
+        "colspan": 2,
+        "title": "Options II"
+        })
     print("Connecting to TWS/IB Gateway...")
-    app.connect("127.0.0.1", 7497, clientId=next_client_id())  # Use your connection parameters.
-    orderApp.connect("127.0.0.1", 7497, clientId=next_client_id())  # Use your connection parameters.
-    historyApp.connect("127.0.0.1", 7497, clientId=next_client_id())  # Use your connection parameters.
+    twsPort = 7497
+    app.connect("127.0.0.1", twsPort, clientId=next_client_id())  # Use your connection parameters.
+    orderApp.connect("127.0.0.1", twsPort, clientId=next_client_id())  # Use your connection parameters.
+    historyApp.connect("127.0.0.1", twsPort, clientId=next_client_id())  # Use your connection parameters.
     
     def run_loop(client):
         client.run()
@@ -141,11 +168,10 @@ async def main():
     })
     tomorrow = pd.Timestamp.now() + pd.Timedelta(days=1)
     
-    symbols = [focusSymbol,vix,thirdSymbol]
+    symbols = [focusSymbol,thirdSymbol]
     optionSymbols = [focusSymbol]
-    app.request_market_data(symbols)
-    app.fetch_options_data(optionSymbols)
-    historyApp.reqHistoricalDataFor(*vix, False, "2 D", "1 day")
+
+    # historyApp.reqHistoricalDataFor(*vix, False, "2 D", "1 day")
     historyApp.reqHistoricalDataFor(*focusSymbol)
 
 

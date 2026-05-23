@@ -16,7 +16,12 @@ def parse_datetime(df, timezone="Europe/Berlin"):
     # Assuming df["date"] contains the epoch data
     # Step 1: Convert epoch to datetime
     try:
-        df["datetime"] = pd.to_datetime(df["date"], unit="s", utc=True)
+        df["datetime"] = pd.to_datetime(
+            pd.to_numeric(df["date"], errors="coerce"),
+            unit="s",
+            utc=True
+        )
+
 
         # Step 2: Convert to New York time
         new_york_tz = pytz.timezone("America/New_York")
@@ -102,7 +107,9 @@ def calc_ta_indicators(df, cfg):
     df["vol_spike"] = (df["volume"] > df["volume"].rolling(window=20).mean() * 2).astype(int)
 
     # Replace NaN IV values with the last valid observation
-    df["IV_close"] = df["IV_close"].fillna(method="ffill")
+    df["IV_close"] = pd.to_numeric(df["IV_close"], errors="coerce")
+
+    df["IV_close"] = df["IV_close"].ffill()
 
     # If NaN persists (e.g., beginning of the dataset), replace it with the rolling mean
     df["IV_close"] = df["IV_close"].fillna(df["IV_close"].rolling(window=10, min_periods=1).mean())
