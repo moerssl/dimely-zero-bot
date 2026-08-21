@@ -107,13 +107,13 @@
                         "day_of_week": "mon-fri",
                         "hour": "9",
                         "minute": "35-59",
-                        "second": "0/30"
+                        "second": "12"
                     },
                     {
                         "day_of_week": "mon-fri",
                         "hour": "10-15",
                         "minute": "*",
-                        "second": "0/30"
+                        "second": "12"
                     }
                     
                 ]
@@ -153,7 +153,7 @@
 
             {
                 "id": "shutdown_IWM",
-                "function": "shutdown_",
+                "function": "shutdown",
                 "multi": [
                     {
                         "day_of_week": "*",
@@ -163,8 +163,8 @@
                     },
                     {
                         "day_of_week": "*",
-                        "hour": "10",
-                        "minute": "10",
+                        "hour": "15",
+                        "minute": "15",
                         "second": "30"
                     },
                     {

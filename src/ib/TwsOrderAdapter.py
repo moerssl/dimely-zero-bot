@@ -1065,7 +1065,7 @@ class TwsOrderAdapter(EWrapper, EClient):
         return baseOrder
     
 
-    def enhanceOrderToCancelInTime(self, order: Order, minutes=1):
+    def enhanceOrderToCancelInTime(self, order: Order, minutes=2):
         # Set the order to be canceled if conditions are not met
         order.conditionsCancelOrder = True
 
