@@ -87,6 +87,9 @@ def calc_ta_indicators(df, cfg):
     df["adx"] = talib.ADX(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
     df["PLUS_DI"] = talib.PLUS_DI(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
     df["MINUS_DI"] = talib.MINUS_DI(high_arr, low_arr, close_arr, timeperiod=cfg["ta"]["adx_timeperiod"])
+    
+    df["ATR14"] = talib.ATR(high_arr, low_arr, close_arr, 14)
+    df["ATR14_target"] = (close_arr - df["ATR14"]).shift(1)
 
     
     # Create a new column for the gap
@@ -134,10 +137,421 @@ def calc_atr_and_volatility(df, cfg):
     df["atr_adjusted"] = df["ATR_percent"].rolling(window=20).quantile(0.25)
     return df, atr, atr_percent
 
+import numpy as np
+import pandas as pd
 
 
+def calc_reference_levels(df, cfg=None):
+    """
+    REF03: Referenzlevel und Handelssignale für 5-Minuten-Kerzen.
 
+    Arbeitet direkt auf dem übergebenen DataFrame.
+    Der ursprüngliche Index bleibt unverändert.
 
+    Erwartete Spalten:
+        date, open, high, low, close
+
+    Unterstützte Datumsformate:
+        - pd.Timestamp
+        - datetime
+        - ISO-Datumsstring
+        - Unix-Timestamp (s, ms, us, ns)
+
+    Voraussetzungen:
+        - Kerzen chronologisch aufsteigend
+        - Zeitstempel = Kerzenbeginn
+        - Nur abgeschlossene Kerzen
+        - Extended-Hours-Daten für PM/ON-Level
+
+    Signale:
+        WAIT
+        long_call
+        long_put
+    """
+
+    cfg = cfg or {}
+
+    tolerance_pct = cfg.get("tolerance_pct", 0.001)
+    min_body_ratio = cfg.get("min_body_ratio", 0.50)
+    input_timezone = cfg.get("input_timezone", "Europe/Berlin")
+
+    required = {"date", "open", "high", "low", "close"}
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(f"Fehlende Spalten: {missing}")
+
+    # --------------------------------------------------
+    # 1. Zeitstempel
+    # --------------------------------------------------
+
+    if "datetime" not in df.columns:
+        raise ValueError(
+            "Spalte 'datetime' fehlt. "
+            "Zuerst parse_datetime(df) aufrufen."
+        )
+
+    idx = pd.DatetimeIndex(df["datetime"])
+
+    if idx.tz is None:
+        raise ValueError(
+            "Die Spalte 'datetime' muss timezone-aware sein."
+        )
+
+    idx = idx.tz_convert("America/New_York")
+
+    if idx.isna().any():
+        raise ValueError("Ungültige Zeitstempel in datetime")
+
+    if not idx.is_monotonic_increasing:
+        raise ValueError(
+            "Kerzen müssen chronologisch aufsteigend sortiert sein"
+        )
+
+    if idx.has_duplicates:
+        raise ValueError("Doppelte Kerzenzeitstempel")
+
+    # --------------------------------------------------
+    # 2. Handelszeiten
+    # --------------------------------------------------
+
+    dates = pd.Series(idx.date, index=df.index)
+    minutes = idx.hour * 60 + idx.minute
+
+    rth = (minutes >= 570) & (minutes < 960)
+    pm = (minutes >= 240) & (minutes < 570)
+
+    overnight = (
+        (minutes >= 1200) |
+        (minutes < 240)
+    )
+
+    # --------------------------------------------------
+    # 3. Previous Day High / Low / Close
+    # --------------------------------------------------
+
+    rth_df = df.loc[rth]
+
+    daily = rth_df.groupby(
+        dates.loc[rth]
+    ).agg(
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last")
+    )
+
+    previous = daily.shift(1)
+
+    df["ref03_pdh"] = dates.map(previous["high"])
+    df["ref03_pdl"] = dates.map(previous["low"])
+    df["ref03_pdc"] = dates.map(previous["close"])
+
+    # --------------------------------------------------
+    # 4. Premarket High / Low
+    # --------------------------------------------------
+
+    pm_df = df.loc[pm]
+
+    pm_levels = pm_df.groupby(
+        dates.loc[pm]
+    ).agg(
+        high=("high", "max"),
+        low=("low", "min")
+    )
+
+    df["ref03_pmh"] = dates.map(pm_levels["high"])
+    df["ref03_pml"] = dates.map(pm_levels["low"])
+
+    df.loc[~rth, [
+        "ref03_pmh",
+        "ref03_pml"
+    ]] = np.nan
+
+    # --------------------------------------------------
+    # 5. Overnight High / Low
+    # 20:00 - 04:00 New York
+    # --------------------------------------------------
+
+    overnight_dates = dates.copy()
+    evening = minutes >= 1200
+
+    overnight_dates.loc[evening] = (
+        pd.to_datetime(dates.loc[evening])
+        + pd.Timedelta(days=1)
+    ).dt.date.to_numpy()
+
+    on_df = df.loc[overnight]
+
+    on_levels = on_df.groupby(
+        overnight_dates.loc[overnight]
+    ).agg(
+        high=("high", "max"),
+        low=("low", "min")
+    )
+
+    df["ref03_onh"] = dates.map(on_levels["high"])
+    df["ref03_onl"] = dates.map(on_levels["low"])
+
+    df.loc[~rth, [
+        "ref03_onh",
+        "ref03_onl"
+    ]] = np.nan
+
+    # --------------------------------------------------
+    # 6. Whole-Dollar-Level
+    # --------------------------------------------------
+
+    df["ref03_whole"] = np.floor(df["close"] + 0.5)
+
+    # --------------------------------------------------
+    # 7. Kerzenmerkmale
+    # --------------------------------------------------
+
+    candle_range = (
+        df["high"] - df["low"]
+    ).clip(lower=1e-9)
+
+    body_ratio = (
+        (df["close"] - df["open"]).abs()
+        / candle_range
+    )
+
+    bullish = (
+        (df["close"] > df["open"]) &
+        (body_ratio >= min_body_ratio)
+    )
+
+    bearish = (
+        (df["close"] < df["open"]) &
+        (body_ratio >= min_body_ratio)
+    )
+
+    prev_open = df["open"].shift(1)
+    prev_high = df["high"].shift(1)
+    prev_low = df["low"].shift(1)
+    prev_close = df["close"].shift(1)
+
+    # --------------------------------------------------
+    # 8. Gültige Bestätigungskerzen
+    # --------------------------------------------------
+
+    rth_series = pd.Series(rth, index=df.index)
+
+    consecutive = (
+        pd.Series(idx, index=df.index).diff()
+        == pd.Timedelta(minutes=5)
+    )
+
+    valid = (
+        rth_series &
+        rth_series.shift(1, fill_value=False) &
+        consecutive
+    )
+
+    # --------------------------------------------------
+    # 9. Signalspalten
+    # --------------------------------------------------
+
+    df["ref03_signal"] = "WAIT"
+    df["ref03_pattern"] = None
+    df["ref03_level"] = None
+    df["ref03_level_price"] = np.nan
+    df["ref03_invalidation"] = np.nan
+    df["ref03_dte"] = np.nan
+
+    n = len(df)
+
+    call_count = np.zeros(n, dtype=int)
+    put_count = np.zeros(n, dtype=int)
+
+    call_level = np.full(n, None, dtype=object)
+    put_level = np.full(n, None, dtype=object)
+
+    call_pattern = np.full(n, None, dtype=object)
+    put_pattern = np.full(n, None, dtype=object)
+
+    call_price = np.full(n, np.nan)
+    put_price = np.full(n, np.nan)
+
+    # --------------------------------------------------
+    # 10. Referenzlevel prüfen
+    # --------------------------------------------------
+
+    level_columns = [
+        "ref03_pdh",
+        "ref03_pdl",
+        "ref03_pmh",
+        "ref03_pml",
+        "ref03_onh",
+        "ref03_onl",
+        "ref03_whole"
+    ]
+
+    for name in level_columns:
+
+        level = (
+            df[name].shift(1)
+            if name == "ref03_whole"
+            else df[name]
+        )
+
+        tol = level * tolerance_pct
+
+        touched = (
+            (prev_low <= level + tol) &
+            (prev_high >= level - tol)
+        )
+
+        # Bullische Rejection
+        bull_rejection = (
+            valid &
+            touched &
+            (prev_close > level) &
+            bullish &
+            (df["close"] > prev_high)
+        )
+
+        # Bearische Rejection
+        bear_rejection = (
+            valid &
+            touched &
+            (prev_close < level) &
+            bearish &
+            (df["close"] < prev_low)
+        )
+
+        # Bullischer Breakout
+        bull_breakout = (
+            valid &
+            (prev_open <= level + tol) &
+            (prev_close > level + tol) &
+            bullish &
+            (df["close"] > prev_high)
+        )
+
+        # Bearischer Breakdown
+        bear_breakdown = (
+            valid &
+            (prev_open >= level - tol) &
+            (prev_close < level - tol) &
+            bearish &
+            (df["close"] < prev_low)
+        )
+
+        call_match = (
+            bull_rejection | bull_breakout
+        ).fillna(False).to_numpy()
+
+        put_match = (
+            bear_rejection | bear_breakdown
+        ).fillna(False).to_numpy()
+
+        call_count += call_match.astype(int)
+        put_count += put_match.astype(int)
+
+        new_call = call_match & pd.isna(call_level)
+        new_put = put_match & pd.isna(put_level)
+
+        call_level[new_call] = name
+        put_level[new_put] = name
+
+        call_price[new_call] = level.to_numpy()[new_call]
+        put_price[new_put] = level.to_numpy()[new_put]
+
+        call_pattern[new_call] = np.where(
+            bull_rejection.to_numpy()[new_call],
+            "REJECTION",
+            "BREAKOUT"
+        )
+
+        put_pattern[new_put] = np.where(
+            bear_rejection.to_numpy()[new_put],
+            "REJECTION",
+            "BREAKOUT"
+        )
+
+    # --------------------------------------------------
+    # 11. Handelszeitfenster (Kerzenschluss)
+    # --------------------------------------------------
+
+    close_idx = idx + pd.Timedelta(minutes=5)
+
+    close_minutes = (
+        close_idx.hour * 60 + close_idx.minute
+    )
+
+    # 09:35 - 11:30 ET
+    morning = (
+        (close_minutes >= 575) &
+        (close_minutes < 690)
+    )
+
+    # 13:05 - 15:30 ET
+    afternoon = (
+        (close_minutes >= 785) &
+        (close_minutes < 930)
+    )
+
+    allowed = morning | afternoon
+
+    # --------------------------------------------------
+    # 12. Handelssignale
+    # --------------------------------------------------
+
+    buy_call = (
+        (call_count > 0) &
+        (put_count == 0) &
+        allowed
+    )
+
+    buy_put = (
+        (put_count > 0) &
+        (call_count == 0) &
+        allowed
+    )
+
+    df.loc[buy_call, "ref03_signal"] = "long_call"
+    df.loc[buy_put, "ref03_signal"] = "long_put"
+
+    df.loc[buy_call, "ref03_pattern"] = call_pattern[buy_call]
+    df.loc[buy_put, "ref03_pattern"] = put_pattern[buy_put]
+
+    df.loc[buy_call, "ref03_level"] = call_level[buy_call]
+    df.loc[buy_put, "ref03_level"] = put_level[buy_put]
+
+    df.loc[buy_call, "ref03_level_price"] = call_price[buy_call]
+    df.loc[buy_put, "ref03_level_price"] = put_price[buy_put]
+
+    df.loc[buy_call, "ref03_invalidation"] = (
+        prev_low.to_numpy()[buy_call]
+    )
+
+    df.loc[buy_put, "ref03_invalidation"] = (
+        prev_high.to_numpy()[buy_put]
+    )
+
+    # --------------------------------------------------
+    # 13. DTE
+    # --------------------------------------------------
+
+    active = buy_call | buy_put
+
+    df.loc[active & morning, "ref03_dte"] = 0
+    df.loc[active & afternoon, "ref03_dte"] = 3
+
+    # --------------------------------------------------
+    # 14. Diagnose und Signalzeitpunkt
+    # --------------------------------------------------
+
+    df["ref03_call_matches"] = call_count
+    df["ref03_put_matches"] = put_count
+
+    df["ref03_signal_time"] = pd.Series(
+        close_idx,
+        index=df.index
+    ).where(active)
+
+    return df
 def calc_technical_signal(df, atr, cfg):
     """
     Compute tech signals:
@@ -832,7 +1246,11 @@ def addIndicatorsOn(self, df, symbol = None):
     df, atr, atr_percent = calc_atr_and_volatility(df, CONFIG)  # Step 3
     df = calc_technical_signal(df, atr, CONFIG)  # Step 4
     df = calc_trend(df)  # Step 5
-    df = calc_time_indicators(df, CONFIG)  # Step 6
+    df = calc_time_indicators(df, CONFIG) 
+    try:# Step 6
+        df = calc_reference_levels(df, CONFIG)
+    except:
+        pass
     df = checkDayRange(df)  # Step 7
     df, current_price, remaining_std_dev = calc_daily_volatility(df, CONFIG)  # Step 8
 

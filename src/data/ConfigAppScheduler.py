@@ -82,9 +82,17 @@ class ConfigAppScheduler(BaseAppScheduler):
         self.load_config()
 
         self.currentDteWheelMinPrice = None
-        self.daySteps = 0
+
+        
+        self.ordersPlacedByOrderRef = {}
 
         Logger.log("Scheduler started")
+        
+    def increaseOrderPlaced(self, orderRef):
+        self.ordersPlacedByOrderRef[orderRef] = self.ordersPlacedByOrderRef.get(orderRef, 0) + 1
+
+    def getOrdersPlaced(self, orderRef):
+        return self.ordersPlacedByOrderRef.get(orderRef, 0)
      
     def run(self):
         """
@@ -595,6 +603,113 @@ class ConfigAppScheduler(BaseAppScheduler):
             self.app.addToActionLog("Ordering Iron Condor")
             self.orderApp.place_combo_order(legs, tp, sl, "IronCondor", getOutOfMarket=False, touchDistance=touchDistance, forceTouchOrder=forceTouchOrder)
             sleep(0.5)
+            
+    def check03ReferenceLevel(self, orderRef="03_Reference", order=True):
+        data = self.app.checkUnderlyingOptions(self.symbol)
+        row = data.get("row")
+        signal = data.get("ref03_signal", "WAIT")
+        if (signal is None):
+            signal = "WAIT"
+        dte = 0
+        if (row is not None):        
+            val = row.get("ref03_dte", 0)
+            dte = int(val) if pd.notna(val) else 0
+            
+        contracts = {}
+        contracts["long_call"] = self.app.get_by_delta_or_lower_by_dte(
+                symbol=self.symbol,
+                target_delta=0.50,
+                min_price=0.10,
+                type="C",
+                targetDTE=dte,
+                exactDTE=True,
+                closestDelta=True
+            )
+        contracts["long_put"] = self.app.get_by_delta_or_lower_by_dte(
+                symbol=self.symbol,
+                target_delta=0.50,
+                min_price=0.10,
+                type="P",
+                targetDTE=dte,
+                exactDTE=True,
+                closestDelta=True
+            )
+        
+        for c in contracts.values():
+            if c is not None:
+                self.app.request_options_market_data(c)
+                
+        if (dte != self.lastRequestedDte):
+            self.goForNextDayOptionsData(dte - self.lastRequestedDte)
+            
+            
+
+        if (order):
+            pass
+        else:
+            
+            
+            if (signal in contracts.keys()):
+                return { f"{signal}": contracts["signal"]}
+            
+            contracts[f"long_{signal}"] = pd.Series({
+                "Symbol": signal
+            })
+            return contracts
+
+    def checkAtrPutCreditSpread(self, wingSpan=50, tp=0.9, tickSize=0.05, orderRef="ATR", order=True):
+        targetType = "P"
+
+        atrTargetPrice = self.app.checkUnderlyingOptions(self.symbol).get("atrTarget", 0)
+        
+        if (not atrTargetPrice or not atrTargetPrice > 0):
+            return
+        
+        shortContract = self.app.find_closest_strike_for_symbol(self.symbol, atrTargetPrice, targetType)
+        longContract = self.app.find_closest_strike_for_symbol(self.symbol, atrTargetPrice - wingSpan, targetType)
+        
+        self.app.request_options_market_data(shortContract)
+        self.app.request_options_market_data(longContract)
+        
+        contract_rows = {
+                "short_put": shortContract,
+                "long_put": longContract
+            }
+        
+        if order:
+            shortBid = shortContract.get("bid")
+            shortAsk = shortContract.get("ask")
+            longBid  = longContract.get("bid")
+            longAsk  = longContract.get("ask")
+            
+            if (shortAsk > 0 and shortBid > 0 and longAsk > 0 and longBid > 0):
+                # 1. Mittelkurse berechnen
+                shortMid = (shortBid + shortAsk) / 2
+                longMid = (longBid + longAsk) / 2
+                
+                # 2. Roh-Midprice des Spreads
+                rawSpreadPrice = shortMid - longMid
+                
+                # 3. Auf die Tick-Size runden (z.B. auf 0.05 Schritte)
+                spreadPrice = round(round(rawSpreadPrice / tickSize) * tickSize, 2) - self.getOrdersPlaced(orderRef) * tickSize
+                if (spreadPrice > 0):
+                    if not self.hasWarmedUp():
+                        self.app.addToActionLog("Awaiting warmup for Wheel Trade")
+                        return
+                    
+                    if self.orderApp.hasOptionPositionsForSymbol(self.symbol):
+                        self.shutdown()
+                    
+                    if self.orderApp.has_existing_order_contracts(contract_rows):
+                        return
+                    
+                    self.increaseOrderPlaced(orderRef)
+                    self.orderApp.place_combo_order(contract_rows, lmt=spreadPrice, ref=orderRef, forceTouchOrder=False, getOutOfMarket=False, touchDistance=None)
+                    
+                    
+        else:
+            return contract_rows
+        
 
     def checkWheelTrade(self, distance=0.2, zeroDteMinPrice=0.2, xDteMinPrice=0.25, order=True):
         putType = "P"
@@ -1187,12 +1302,13 @@ class ConfigAppScheduler(BaseAppScheduler):
             multiplier = float(contract.multiplier)
             costBasis = float(pos.get("avgCost")) / multiplier 
             
-            if costBasis < self.minPrice * 2 and len(positions) == 1:
+            if costBasis < self.minPrice * 2 and len(positions) >= 1:
                 
                 #if order:
                 #    jobs = self.scheduler.get_jobs()
                 #    if job_id in jobs:
                 #        self.scheduler.remove_job(job_id=job_id)
+                self.shutdown()
                 return "Skip take option profit. costbase too low"
             
             marketData = self.app.find_single_contract_by_id(contract.conId)

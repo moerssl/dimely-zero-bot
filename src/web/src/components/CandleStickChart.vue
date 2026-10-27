@@ -1,6 +1,7 @@
 <template>
   <!-- Using v-chart (from vue-echarts) with a fixed overall height to accommodate multiple grids -->
-  <button @click="toggleStrategyCol">Toggle Strategy Column</button>
+  <button @click="toggleStrategyCol">Toggle Strategy Column</button><br>
+  <button @click="strategyCol = 'ref03_signal'">03 Strategy</button>
   Current strategy column: {{ strategyCol }}
   <div>
     <p v-for="(item, index) in strategyColorMap" :key="index">
@@ -152,7 +153,9 @@ const strategyColorMap = computed(() => {
   return {
     "SellCall": "#00ff00aa", // Green
 
-    "SellPut": "#ff0000aa"
+    "SellPut": "#ff0000aa",
+    "BUY_CALL": "#9dad34aa",
+    "BUY_PUT": "#bb55ffaa"
   }
 
 })
@@ -172,13 +175,13 @@ const splitAreaColors2 = computed(() =>
   props.chartData.map(d => d.sentiment +": "+sentimentColorMap.value[d.sentiment] || 'transparent')
 )
 
-const strategyCol = ref('final_signal') // Default to 'tech_signal', can toggle to 'strategy'
+const strategyCol = ref('ref03_signal') // Default to 'tech_signal', can toggle to 'strategy'
 // Compute background highlighting using markArea
 const markAreas = computed(() => {
   const areas = []
   const col = strategyCol.value
   props.chartData.forEach((d, idx) => {
-    const signal = d[col].name
+    const signal = d[col].name || d[col]
     areas.push([
 
       { xAxis: idx , itemStyle: { color: strategyColorMap.value[signal] || 'transparent' } },
@@ -487,6 +490,7 @@ const chartOption = computed(() => {
           color: '#ffffffaa'
         }
       },
+
     ],
     visualMap: [
       {

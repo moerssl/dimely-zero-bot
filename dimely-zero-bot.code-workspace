@@ -23,6 +23,9 @@
 		{
 			"name": "pythonclient",
 			"path": "../../../../TWS API/source/pythonclient"
+		},
+		{
+			"path": "../spx-backtest"
 		}
 	],
 	"settings": {

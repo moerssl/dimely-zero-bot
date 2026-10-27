@@ -50,6 +50,9 @@ class BaseAppScheduler:
         
         self.scheduler.add_listener(self.handleError, EVENT_JOB_ERROR)
         self.itmOptions = set()
+        
+        self.daySteps = 0
+        self.lastRequestedDte = 0
 
     def reset_start_time(self):
         self.startTime = datetime.now()
@@ -313,6 +316,8 @@ class BaseAppScheduler:
             
             try:
                 self.app.fetch_next_days_options_data(daysToAdd)
+                
             except Exception as error:
                 self.app.addToActionLog("error fetchiung next day")
+            self.lastRequestedDte += daysToAdd
             self.daySteps += 1

@@ -383,7 +383,7 @@ class IBApp(IBWrapper, IBClient):
         except Exception as err:
             return 1
 
-    def fetch_options_data(self, symbols, date: datetime = datetime.today()):
+    def fetch_options_data(self, symbols, date: datetime = datetime.today(), rights=["C", "P"]):
         self.lastRequestedDateForContracts = date
         if self.optionUnderlyings is None:
             self.optionUnderlyings = symbols
@@ -396,7 +396,7 @@ class IBApp(IBWrapper, IBClient):
             except Exception as e:
                 self.addToActionLog("Error sending telegram message: " + str(e))
 
-            for right in ["C", "P"]:
+            for right in rights:
                 req = self.nextReqId()
 
                 contract = Contract()
@@ -698,8 +698,16 @@ class IBApp(IBWrapper, IBClient):
                     "content": self.get_strategy_statistics(self.candleData.get(symbol, pd.DataFrame())),
                     "colspan": 2
                 },
-
-                
+                {
+                    "title": "Candle Data",
+                    "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
+                    "colspan": 4,
+                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
+                },
+                {
+                    "title": "Options Data",
+                    "content": self.options_data
+                },
                 *self.getAdditionalTiles(),
 
                 
@@ -717,12 +725,7 @@ class IBApp(IBWrapper, IBClient):
     
         """
 
-                {
-                    "title": "Candle Data",
-                    "content": self.candleData.get(symbol, pd.DataFrame()).iloc[::-1],
-                    "colspan": 4,
-                    "exclude_columns": ["minutes_since_open", "remaining_intervals", "volume", "wap", "count"]
-                },
+
                 {
                     "title": "Candle Data VIX",
                     "content": self.candleData.get("VIX", pd.DataFrame()).iloc[::-1],
@@ -1076,7 +1079,7 @@ class IBApp(IBWrapper, IBClient):
     def filter_options_data(self, symbol, type="C"):
         with self.optionsDataLock:
             # Ensure the boolean Series and DataFrame have the same index
-            mask = (self.options_data["Symbol"] == symbol) & (self.options_data["Type"] == type) & (self.options_data["bid"] > 0) & (self.options_data["ask"] > 0)
+            mask = (self.options_data["Symbol"] == symbol) & (self.options_data["Type"] == type) # & (self.options_data["bid"] > 0) & (self.options_data["ask"] > 0)
             aligned_mask = mask.reindex(self.options_data.index, fill_value=False)
 
             # Print indices for debugging
@@ -1120,13 +1123,168 @@ class IBApp(IBWrapper, IBClient):
 
         return df.loc[valid_indices[nth_closest - 1]]
 
+
     def get_by_delta_or_lower_by_dte(
         self,
         symbol,
         target_delta,
         min_price,
         type="C",
-        target_underlying_price=None
+        target_underlying_price=None,
+        targetDTE=0,
+        exactDTE=False,
+        closestDelta=False
+    ):
+        df = self.filter_options_data(symbol, type)
+
+        required = [
+            "delta",
+            "Strike",
+            "undPrice",
+            "Expiry",
+            "ask"
+        ]
+
+        if df.empty or not all(
+            col in df.columns for col in required
+        ):
+            return None
+
+        df = df.copy()
+
+        # ---------------------------------------
+        # Datentypen
+        # ---------------------------------------
+
+        df["delta"] = pd.to_numeric(
+            df["delta"], errors="coerce"
+        )
+
+        df["ask"] = pd.to_numeric(
+            df["ask"], errors="coerce"
+        )
+
+        df["Strike"] = pd.to_numeric(
+            df["Strike"], errors="coerce"
+        )
+
+        df["Expiry"] = pd.to_datetime(
+            df["Expiry"],
+            format="%Y%m%d",
+            errors="coerce"
+        )
+
+        # ---------------------------------------
+        # Basisfilter
+        # ---------------------------------------
+
+        mask = (
+            df["delta"].notna() &
+            (df["ask"] >= min_price)
+        )
+
+        if not closestDelta:
+            mask &= (
+                df["delta"].abs() <= abs(target_delta)
+            )
+
+        # ---------------------------------------
+        # Underlying-Preisfilter
+        # ---------------------------------------
+
+        if target_underlying_price is not None:
+
+            if type == "C":
+                mask &= (
+                    df["Strike"] >= target_underlying_price
+                )
+
+            elif type == "P":
+                mask &= (
+                    df["Strike"] <= target_underlying_price
+                )
+
+        # ---------------------------------------
+        # DTE
+        # ---------------------------------------
+
+        today = pd.Timestamp(
+            pd.Timestamp.now(
+                tz="America/New_York"
+            ).date()
+        )
+
+        df["DTE"] = (
+            df["Expiry"] - today
+        ).dt.days
+
+        if exactDTE:
+            mask &= df["DTE"] == targetDTE
+        else:
+            mask &= df["DTE"] >= targetDTE
+
+        valid = df.loc[mask].copy()
+
+        if valid.empty:
+            return None
+
+        # ---------------------------------------
+        # Sortierung
+        # ---------------------------------------
+
+        if closestDelta:
+
+            valid["deltaDistance"] = (
+                valid["delta"].abs() -
+                abs(target_delta)
+            ).abs()
+
+            if "bid" in valid.columns:
+                valid["bid"] = pd.to_numeric(
+                    valid["bid"], errors="coerce"
+                )
+
+                valid["spread"] = (
+                    valid["ask"] - valid["bid"]
+                )
+
+                valid = valid[
+                    (valid["bid"] > 0) &
+                    (valid["spread"] >= 0)
+                ]
+
+                if valid.empty:
+                    return None
+
+                valid = valid.sort_values(
+                    ["DTE", "deltaDistance", "spread"],
+                    ascending=[True, True, True]
+                )
+
+            else:
+                valid = valid.sort_values(
+                    ["DTE", "deltaDistance", "ask"],
+                    ascending=[True, True, False]
+                )
+
+        else:
+            # Ursprüngliches Verhalten
+            valid = valid.sort_values(
+                ["DTE", "ask"],
+                ascending=[True, False]
+            )
+
+        return valid.iloc[0]
+
+
+    def get_by_delta_or_lower_by_dte_old(
+        self,
+        symbol,
+        target_delta,
+        min_price,
+        type="C",
+        target_underlying_price=None,
+        targetDTE=0
     ):
         df = self.filter_options_data(symbol, type)
 
@@ -1158,7 +1316,7 @@ class IBApp(IBWrapper, IBClient):
         df['DTE'] = (df['Expiry'] - today).dt.days
 
         # Keep only valid expiries
-        valid = df[mask & (df['DTE'] >= 0)]
+        valid = df[mask & (df['DTE'] >= targetDTE)]
         if valid.empty:
             return None
 
@@ -1887,6 +2045,12 @@ class IBApp(IBWrapper, IBClient):
                 self.logger.debug(f"self.candleData[symbol].columns: {self.candleData[symbol].columns}")
                 self.logger.debug(f"self.candleData[symbol] before update: {self.candleData[symbol]}")
 
+                self.candleData[symbol] = (
+                    self.candleData[symbol]
+                    .drop_duplicates(subset=["date"], keep="last")
+                    .reset_index(drop=True)
+                )
+
                 # Check if the row already exists and update only the relevant columns
                 existing_index = self.candleData[symbol][self.candleData[symbol]['date'] == bar.date].index
 
@@ -1971,6 +2135,8 @@ class IBApp(IBWrapper, IBClient):
         sentiment = None
         prevSentiment = None
         price = None
+        atrTarget = None
+        referenceSignal = None
         with self.candleLock:
             if (symbol in self.candleData):
                 df: pd.DataFrame = self.candleData[symbol]
@@ -1985,10 +2151,14 @@ class IBApp(IBWrapper, IBClient):
                     call = row["call_strike"]
                     sentiment = row["sentiment"]
                     price = row["close"]
+                    atrTarget = row["ATR14_target"]
+                    referenceSignal = row["ref03_signal"]
                     prevSentiment = rowBeforeRow["sentiment"] if rowBeforeRow is not None else None
             return {
                 "date": date,
                 "price": price,
+                "atrTarget": atrTarget,
+                "ref03_signal": referenceSignal,
                 "signal": signal,
                 "sentiment": sentiment,
                 "prevSentiment": prevSentiment,
@@ -2016,7 +2186,7 @@ class IBApp(IBWrapper, IBClient):
                 # Generate all possible columns with and without prefixes
                 prefixes = [p[1] for p in self.marketDataPrefix]
                 base_columns = ["date", "open", "close", "high", "low", "volume", "wap", "count"]
-                columns = ["date", "open", "close", "night_gap", "trend", "call_strike", "put_strike", "call_p", "put_p", "c_dist", "p_dist", "final_signal", "tech_signal", "high", "low", "strategy", "sentiment", "volume", "wap", "count"]
+                columns = ["date", "open", "close", "ATR14", "ATR14_target", "ref03_signal", "call_strike", "put_strike", "call_p", "put_p", "c_dist", "p_dist", "final_signal", "tech_signal", "high", "low", "strategy", "sentiment", "volume", "wap", "count"]
 
                 for pre in prefixes:
                     for col in base_columns:

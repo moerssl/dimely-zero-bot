@@ -179,27 +179,23 @@
         ],
         "SPY": [
             {
-                "id": "checkFixedDistanceIronCondor_SPY",
-                "function": "checkFixedDistanceIronCondor",
+                "id": "reference_03",
+                "function": "check03ReferenceLevel",
                 "day_of_week": "mon-fri",
                 "terminalTitle": true,
-                "hour": 15,
+                "hour": "9-15",
                 "minute": "0-5",
-                "second": "0/30",
-                "backtest": "https://app.optionalpha.com/zdte/backtester/test/ZT3174939040939454623",
+                "second": "0/30",                
 
                 "kwargs": {
-                    "distance": 0.01,
-                    "wingspan": 3,
-                    "tp": 20,
-                    "sl": 200,
-                    "touchDistance": 3
+                    "orderRef": "ref03",
+                    "order": false
                     
                 }
             },
             {
                 "id": "shutdownOrb_SPY",
-                "function": "shutdown",
+                "function": "shutdown_",
                 "day_of_week": "mon-fri",
                 "hour": 15,
                 "minute": "6",
@@ -254,27 +250,31 @@
         ],
         "SPX": [
             {
-                "id": "dale_iron_fly_primary",
-                "function": "checkSeparatedIronCondor",
+                "id": "atr_credit_spread",
+                "function": "checkAtrPutCreditSpread",
                 "day_of_week": "mon-fri",
-                "hour": 10,
-                "minute": 30,
+                "hour": "10-11",
+                "minute": "*",
                 "terminalTitle": true,
                 "kwargs": {
-                    "callDistance": 0,
-                    "putDistance": 0,
-                    "wingspan": 50,
-                    "tp": 0.5,
-                    "sl": 1.0,
-                    "order": false
+                    "wingSpan": 50
                 }
             },
             {
-                "id": "shutdownOrb_SPX",
-                "function": "shutdown_",
-                "day_of_week": "mon-fri",
-                "hour": 14,
-                "minute": "45",
+                "id": "shutdown_SPX",
+                "function": "shutdown",
+                "multi": [
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": 11,
+                        "minute": "05"
+                    },
+                    {
+                        "day_of_week": "mon-fri",
+                        "hour": 9,
+                        "minute": "05"
+                    }
+                ],
                 "display": false
             }
         ],

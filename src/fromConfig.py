@@ -1,3 +1,4 @@
+import datetime
 import subprocess
 from util.Logger import Logger
 import threading
@@ -20,7 +21,18 @@ from data.ConfigAppScheduler import ConfigAppScheduler
 import os
 import sys
 import psutil
-symbolParam = sys.argv[1] if len(sys.argv) > 1 else "qqq"
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-s", "--symbol", default="qqq")
+parser.add_argument("-t", "--time", default="8 D")
+parser.add_argument("-c", "--candle-size", default="5 mins")
+
+args = parser.parse_args()
+
+symbolParam = args.symbol
+timeParam = args.time
+candleSizeParam = args.candle_size
 
 
 
@@ -56,7 +68,7 @@ def is_already_running():
 async def main():
     # Initialize IBApp and connect.
     app = IBApp()
-    historyApp = IBApp(lookBackTime="8 D")
+    historyApp = IBApp(lookBackTime=timeParam, candleSize=candleSizeParam)
     orderApp = TwsOrderAdapter()
     focusSymbol = (symbolParam, "STK", "SMART")
     if symbolParam.lower() == "spx" or symbolParam.lower() == "xsp":
@@ -85,10 +97,22 @@ async def main():
             targetStrikeByPosition = stock_position.get("avgCost", None)
             if targetStrikeByPosition:
                 app.optionMarketDataRequestTargetStrike = targetStrikeByPosition
+                
+        today = datetime.date.today()
+
+        # Friday is index 4 (Monday = 0, ..., Sunday = 6)
+        days_ahead = (4 - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7  # Moves to next week if today is Friday
+
+        next_friday = today + datetime.timedelta(days=days_ahead)
 
         
         app.request_market_data(symbols)
-        app.fetch_options_data(optionSymbols)
+        if (symbolParam.lower() == "spx"):
+            app.fetch_options_data(optionSymbols, next_friday, ["P"])
+        else:
+            app.fetch_options_data(optionSymbols)
         app.request_all_options_data()
         
     orderApp.onPositionEnd(req)

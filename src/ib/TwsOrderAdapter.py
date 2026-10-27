@@ -224,13 +224,13 @@ class TwsOrderAdapter(EWrapper, EClient):
         return True
 
 
-    def place_combo_order(self, contract_rows, tp=None, sl=None, ref="IronCondor", touchDistance=0.5, amount=1, getOutOfMarket=True, useMidPrice=False, forceTouchOrder=False):
+    def place_combo_order(self, contract_rows, tp=None, sl=None, ref="IronCondor", touchDistance=0.5, amount=1, getOutOfMarket=True, useMidPrice=False, forceTouchOrder=False, lmt=None):
         #start a new thread to place the order
         if (not TwsOrderAdapter.validateSpread(contract_rows)):
             self.addToActionLog("Invalid Spread, abort")
             return
         
-        thread = Thread(target=self.place_combo_order_threaded, args=(contract_rows, tp, sl, ref,touchDistance,amount, getOutOfMarket, useMidPrice, forceTouchOrder))
+        thread = Thread(target=self.place_combo_order_threaded, args=(contract_rows, tp, sl, ref,touchDistance,amount, getOutOfMarket, useMidPrice, forceTouchOrder, lmt))
         thread.start()
 
     def round_to_next_multiple(self, number, multiple=0.05):
@@ -242,7 +242,7 @@ class TwsOrderAdapter(EWrapper, EClient):
         """
         return round(number / multiple) * multiple
 
-    def place_combo_order_threaded(self, contract_rows, tp=None, sl=None, ref="IronCondor", touchDistance=0.5, amount=1, getOutOfMarket=True, useMidPrice=False, forceTouchOrder=False):
+    def place_combo_order_threaded(self, contract_rows, tp=None, sl=None, ref="IronCondor", touchDistance=0.5, amount=1, getOutOfMarket=True, useMidPrice=False, forceTouchOrder=False, lmt=None):
         try:
             with self.orderLock:
                 if(contract_rows is None):
@@ -296,6 +296,9 @@ class TwsOrderAdapter(EWrapper, EClient):
                 if (row["Symbol"] == "SPX"):
                     multiple = 0.05
                     makeItMarketable = 0.05
+                    
+                if (lmt):
+                    limit_price = lmt
                 if (useMidPrice):
                     limit_price = TwsOrderAdapter.calculateSpreadMidPrice(contract_rows)
                 else:
